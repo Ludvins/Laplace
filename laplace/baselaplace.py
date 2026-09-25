@@ -39,6 +39,7 @@ from laplace.utils.utils import (
 
 __all__ = [
     "BaseLaplace",
+    "BaseFunctionalLaplace",
     "ParametricLaplace",
     "FunctionalLaplace",
     "FullLaplace",
@@ -60,7 +61,8 @@ class BaseLaplace:
         then does prediction as in regression likelihood. The model needs to be defined accordingly:
         The forward pass during training takes `x.shape == (batch_size, 2, dim)` with
         `y.shape = (batch_size,)`. Meanwhile, during evaluation `x.shape == (batch_size, dim)`.
-        Note that 'reward_modeling' only supports `KronLaplace` and `DiagLaplace`.
+        Reward modeling is supported by `KronLaplace`, `DiagLaplace`, `ELLA`,
+        and `VaLLA`.
     sigma_noise : torch.Tensor or float, default=1
         observation noise for the regression setting; must be 1 for classification
     prior_precision : torch.Tensor or float, default=1
@@ -244,8 +246,13 @@ class BaseLaplace:
         self,
         x: torch.Tensor | MutableMapping[str, torch.Tensor | Any],
         pred_type: PredType | str,
-        link_approx: LinkApprox | str,
-        n_samples: int,
+        joint: bool = False,
+        link_approx: LinkApprox | str = LinkApprox.PROBIT,
+        n_samples: int = 100,
+        diagonal_output: bool = False,
+        generator: torch.Generator | None = None,
+        fitting: bool = False,
+        **model_kwargs: dict[str, Any],
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
@@ -256,7 +263,9 @@ class BaseLaplace:
         link_approx: LinkApprox | str,
         n_samples: int,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        return self(x, pred_type, link_approx, n_samples)
+        return self(
+            x, pred_type=pred_type, link_approx=link_approx, n_samples=n_samples
+        )
 
     def _check_jacobians(self, Js: torch.Tensor) -> None:
         if not isinstance(Js, torch.Tensor):
@@ -2135,7 +2144,178 @@ class DiagLaplace(ParametricLaplace):
         return self.mean.reshape(1, self.n_params) + samples
 
 
-class FunctionalLaplace(BaseLaplace):
+class BaseFunctionalLaplace(BaseLaplace):
+    """Shared prediction interface for function-space posterior approximations."""
+
+    def _glm_predictive_distribution(
+        self, x: torch.Tensor | MutableMapping, joint: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Concrete function-space methods provide latent moments."""
+        raise NotImplementedError
+
+    def _refresh_posterior(self) -> None:
+        """Update cached posterior quantities after a hyperparameter change."""
+
+    def _check_fitted(self) -> None:
+        if not getattr(self, "_fitted", False):
+            raise RuntimeError("Call fit before making functional Laplace predictions.")
+        self._refresh_posterior()
+
+    def predictive_moments(
+        self, x: torch.Tensor | MutableMapping, *, joint: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return latent output mean and covariance in model-output units."""
+        self._check_fitted()
+        return self._glm_predictive_distribution(x, joint=joint)
+
+    def __call__(
+        self,
+        x: torch.Tensor | MutableMapping,
+        pred_type: PredType | str = PredType.GP,
+        joint: bool = False,
+        link_approx: LinkApprox | str = LinkApprox.PROBIT,
+        n_samples: int = 100,
+        diagonal_output: bool = False,
+        generator: torch.Generator | None = None,
+        fitting: bool = False,
+        **model_kwargs: dict[str, Any],
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Predict from the fitted function-space posterior.
+
+        Classification returns probabilities `[B, C]`; regression and scalar
+        reward prediction return a latent mean `[B, O]` and covariance
+        `[B, O, O]`. With `joint=True`, the mean is flattened and covariance
+        has shape `[B*O, B*O]`. `fitting=True` evaluates pairwise reward inputs
+        as classification. `link_approx` selects the classification link, and
+        `n_samples` controls Monte Carlo links. Only `pred_type='gp'` is
+        supported; use `functional_samples` for latent draws.
+        """
+        self._check_fitted()
+        if pred_type != PredType.GP:
+            raise ValueError("Only gp is supported as a functional prediction type.")
+        if link_approx not in list(LinkApprox):
+            raise ValueError(f"Unsupported link approximation {link_approx}.")
+        if generator is not None and (
+            not isinstance(generator, torch.Generator)
+            or generator.device != self._device
+        ):
+            raise ValueError("Invalid random generator (check type and device).")
+        likelihood = self.likelihood
+        if likelihood == Likelihood.REWARD_MODELING:
+            likelihood = Likelihood.CLASSIFICATION if fitting else Likelihood.REGRESSION
+        if likelihood == Likelihood.CLASSIFICATION and link_approx == LinkApprox.MC:
+            return self.predictive_samples(
+                x,
+                n_samples=n_samples,
+                diagonal_output=diagonal_output,
+                generator=generator,
+                fitting=fitting,
+            ).mean(dim=0)
+        return self._glm_forward_call(
+            x, likelihood, joint, link_approx, n_samples, diagonal_output
+        )
+
+    @staticmethod
+    def _draw_gaussian(
+        mean: torch.Tensor,
+        covariance: torch.Tensor,
+        n_samples: int,
+        generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        covariance = (covariance + covariance.transpose(-1, -2)) / 2
+        try:
+            root = torch.linalg.cholesky(covariance)
+        except LinAlgError:
+            # A rank-limited function-space posterior can be singular.
+            values, vectors = torch.linalg.eigh(covariance)
+            if torch.any(values < -1e-5):
+                raise
+            root = vectors @ torch.diag_embed(values.clamp_min(0).sqrt())
+        noise = torch.randn(
+            (n_samples, *mean.shape),
+            device=mean.device,
+            dtype=mean.dtype,
+            generator=generator,
+        )
+        if mean.ndim == 1:
+            draws = noise @ root.T
+        else:
+            draws = torch.einsum("bij,sbj->sbi", root, noise)
+        return mean.unsqueeze(0) + draws
+
+    def _glm_functional_samples(
+        self,
+        f_mu: torch.Tensor,
+        f_var: torch.Tensor,
+        n_samples: int,
+        diagonal_output: bool = False,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        covariance = (
+            torch.diag_embed(f_var.diagonal(dim1=-2, dim2=-1))
+            if diagonal_output
+            else f_var
+        )
+        return self._draw_gaussian(f_mu, covariance, n_samples, generator)
+
+    def functional_samples(
+        self,
+        x: torch.Tensor | MutableMapping,
+        pred_type: PredType | str = PredType.GLM,
+        n_samples: int = 100,
+        diagonal_output: bool = False,
+        generator: torch.Generator | None = None,
+        joint: bool = False,
+    ) -> torch.Tensor:
+        """Draw latent outputs; use `joint=True` to retain cross-input covariance.
+
+        The `pred_type` argument is retained for `FunctionalLaplace` API
+        compatibility. All accepted values draw from the function-space
+        posterior; `"nn"` does not sample model weights.
+        """
+        self._check_fitted()
+        if pred_type not in list(PredType):
+            raise ValueError(f"Unsupported functional sampling type {pred_type}.")
+        if n_samples <= 0:
+            raise ValueError("n_samples must be positive.")
+        mean, covariance = self._glm_predictive_distribution(x, joint=joint)
+        if joint:
+            batch = (
+                x[self.dict_key_x].shape[0]
+                if isinstance(x, MutableMapping)
+                else x.shape[0]
+            )
+            n_outputs = mean.numel() // batch
+            if diagonal_output:
+                output_ids = torch.arange(mean.numel(), device=mean.device) % n_outputs
+                covariance = covariance * (output_ids[:, None] == output_ids[None, :])
+            draws = self._draw_gaussian(mean, covariance, n_samples, generator)
+            return draws.reshape(n_samples, batch, n_outputs)
+        return self._glm_functional_samples(
+            mean, covariance, n_samples, diagonal_output, generator
+        )
+
+    def predictive_samples(
+        self,
+        x: torch.Tensor | MutableMapping,
+        pred_type: PredType | str = PredType.GLM,
+        n_samples: int = 100,
+        diagonal_output: bool = False,
+        generator: torch.Generator | None = None,
+        fitting: bool = False,
+        joint: bool = False,
+    ) -> torch.Tensor:
+        samples = self.functional_samples(
+            x, pred_type, n_samples, diagonal_output, generator, joint
+        )
+        if self.likelihood == Likelihood.CLASSIFICATION or (
+            self.likelihood == Likelihood.REWARD_MODELING and fitting
+        ):
+            return samples.softmax(dim=-1)
+        return samples
+
+
+class FunctionalLaplace(BaseFunctionalLaplace):
     """Applying the GGN (Generalized Gauss-Newton) approximation for the Hessian in the Laplace approximation of the posterior
     turns the underlying probabilistic model from a BNN into a GLM (generalized linear model).
     This GLM (in the weight space) is equivalent to a GP (in the function space), see
@@ -2165,7 +2345,8 @@ class FunctionalLaplace(BaseLaplace):
         then does prediction as in regression likelihood. The model needs to be defined accordingly:
         The forward pass during training takes `x.shape == (batch_size, 2, dim)` with
         `y.shape = (batch_size,)`. Meanwhile, during evaluation `x.shape == (batch_size, dim)`.
-        Note that 'reward_modeling' only supports `KronLaplace` and `DiagLaplace`.
+        Reward modeling is supported by `KronLaplace`, `DiagLaplace`, `ELLA`,
+        and `VaLLA`.
     sigma_noise : torch.Tensor or float, default=1
         observation noise for the regression setting; must be 1 for classification
     prior_precision : torch.Tensor or float, default=1
@@ -2405,6 +2586,7 @@ class FunctionalLaplace(BaseLaplace):
                     torch.nan_to_num(1 / (self._H_factor * self.L), posinf=10.0)
                 )
             )
+        self._recompute_Sigma = False
 
     def _get_SoD_data_loader(self, train_loader: DataLoader) -> DataLoader:
         """Subset-of-Datapoints data loader"""
@@ -2549,184 +2731,12 @@ class FunctionalLaplace(BaseLaplace):
             else (f_mu, f_var)
         )
 
-    def __call__(
-        self,
-        x: torch.Tensor | MutableMapping,
-        pred_type: PredType | str = PredType.GP,
-        joint: bool = False,
-        link_approx: LinkApprox | str = LinkApprox.PROBIT,
-        n_samples: int = 100,
-        diagonal_output: bool = False,
-        generator: torch.Generator | None = None,
-        fitting: bool = False,
-        **model_kwargs: dict[str, Any],
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Compute the posterior predictive on input data `x`.
-
-        Parameters
-        ----------
-        x : torch.Tensor or MutableMapping
-            `(batch_size, input_shape)` if tensor. If MutableMapping, must contain
-            the said tensor.
-
-        pred_type : {'gp'}, default='gp'
-            type of posterior predictive, linearized GLM predictive (GP).
-            The GP predictive is consistent with
-            the curvature approximations used here.
-
-        link_approx : {'mc', 'probit', 'bridge', 'bridge_norm'}
-            how to approximate the classification link function for the `'glm'`.
-
-        joint : bool
-            Whether to output a joint predictive distribution in regression with
-            `pred_type='glm'`. If set to `True`, the predictive distribution
-            has the same form as GP posterior, i.e. N([f(x1), ...,f(xm)], Cov[f(x1), ..., f(xm)]).
-            If `False`, then only outputs the marginal predictive distribution.
-            Only available for regression and GLM predictive.
-
-        n_samples : int
-            number of samples for `link_approx='mc'`.
-
-        diagonal_output : bool
-            whether to use a diagonalized posterior predictive on the outputs.
-            Only works for `link_approx='mc'`.
-
-        generator : torch.Generator, optional
-            random number generator to control the samples (if sampling used).
-
-        fitting : bool, default=False
-            whether or not this predictive call is done during fitting. Only useful for
-            reward modeling: the likelihood is set to `"regression"` when `False` and
-            `"classification"` when `True`.
-
-        Returns
-        -------
-        predictive: torch.Tensor or Tuple[torch.Tensor]
-            For `likelihood='classification'`, a torch.Tensor is returned with
-            a distribution over classes (similar to a Softmax).
-            For `likelihood='regression'`, a tuple of torch.Tensor is returned
-            with the mean and the predictive variance.
-            For `likelihood='regression'` and `joint=True`, a tuple of torch.Tensor
-            is returned with the mean and the predictive covariance.
-        """
-        if self._fitted is False:
-            raise RuntimeError(
-                "Functional Laplace has not been fitted to any "
-                + "training dataset. Please call .fit method."
-            )
-
-        if self._recompute_Sigma is True:
+    def _refresh_posterior(self) -> None:
+        if self._recompute_Sigma:
             warnings.warn(
-                "The prior precision has been changed since fit. "
-                + "Re-compututing its value..."
+                "The prior precision has changed since fit; recomputing the GP posterior."
             )
             self._build_Sigma_inv()
-
-        if pred_type != PredType.GP:
-            raise ValueError("Only gp supported as prediction types.")
-
-        if link_approx not in [la for la in LinkApprox]:
-            raise ValueError(f"Unsupported link approximation {link_approx}.")
-
-        if generator is not None:
-            if (
-                not isinstance(generator, torch.Generator)
-                or generator.device != x.device
-            ):
-                raise ValueError("Invalid random generator (check type and device).")
-
-        likelihood = self.likelihood
-        if likelihood == Likelihood.REWARD_MODELING:
-            likelihood = Likelihood.CLASSIFICATION if fitting else Likelihood.REGRESSION
-
-        return self._glm_forward_call(
-            x, likelihood, joint, link_approx, n_samples, diagonal_output
-        )
-
-    def functional_samples(
-        self,
-        x: torch.Tensor | MutableMapping[str, torch.Tensor | Any],
-        pred_type: PredType | str = PredType.GLM,
-        n_samples: int = 100,
-        diagonal_output: bool = False,
-        generator: torch.Generator | None = None,
-    ) -> torch.Tensor:
-        """Sample from the functional posterior on input data `x`.
-        Can be used, for example, for Thompson sampling.
-
-        Parameters
-        ----------
-        x : torch.Tensor or MutableMapping
-            input data `(batch_size, input_shape)`
-
-        pred_type : {'glm'}, default='glm'
-            type of posterior predictive, linearized GLM predictive.
-
-        n_samples : int
-            number of samples
-
-        diagonal_output : bool
-            whether to use a diagonalized glm posterior predictive on the outputs.
-            Only applies when `pred_type='glm'`.
-
-        generator : torch.Generator, optional
-            random number generator to control the samples (if sampling used)
-
-        Returns
-        -------
-        samples : torch.Tensor
-            samples `(n_samples, batch_size, output_shape)`
-        """
-        if pred_type not in PredType.__members__.values():
-            raise ValueError("Only glm  supported as prediction type.")
-
-        f_mu, f_var = self._glm_predictive_distribution(x)
-        return self._glm_functional_samples(
-            f_mu, f_var, n_samples, diagonal_output, generator
-        )
-
-    def predictive_samples(
-        self,
-        x: torch.Tensor | MutableMapping[str, torch.Tensor | Any],
-        pred_type: PredType | str = PredType.GLM,
-        n_samples: int = 100,
-        diagonal_output: bool = False,
-        generator: torch.Generator | None = None,
-    ) -> torch.Tensor:
-        """Sample from the posterior predictive on input data `x`.
-        I.e., the corresponding inverse-link function is applied on top of the
-        functional sample. Can be used, for example, for Thompson sampling.
-
-        Parameters
-        ----------
-        x : torch.Tensor or MutableMapping
-            input data `(batch_size, input_shape)`
-
-        pred_type : {'glm'}, default='glm'
-            type of posterior predictive, linearized GLM predictive.
-
-        n_samples : int
-            number of samples
-
-        diagonal_output : bool
-            whether to use a diagonalized glm posterior predictive on the outputs.
-            Only applies when `pred_type='glm'`.
-
-        generator : torch.Generator, optional
-            random number generator to control the samples (if sampling used)
-
-        Returns
-        -------
-        samples : torch.Tensor
-            samples `(n_samples, batch_size, output_shape)`
-        """
-        if pred_type not in PredType.__members__.values():
-            raise ValueError("Only glm  supported as prediction type.")
-
-        f_mu, f_var = self._glm_predictive_distribution(x)
-        return self._glm_predictive_samples(
-            f_mu, f_var, n_samples, diagonal_output, generator
-        )
 
     @property
     def gp_kernel_prior_variance(self):
@@ -3297,13 +3307,14 @@ class FunctionalLaplace(BaseLaplace):
         self.mu = state_dict["mu"]
         self.L = state_dict["L"]
         self._fitted = state_dict["_fitted"]
-        self._recompute_Sigma = state_dict["_recompute_Sigma"]
         self.train_loader = state_dict["train_loader"]
 
         self.loss = state_dict["loss"]
         self.prior_mean = state_dict["prior_mean"]
         self.prior_precision = state_dict["prior_precision"]
         self.sigma_noise = state_dict["sigma_noise"]
+        # The property setters mark the factor stale; restore the saved state.
+        self._recompute_Sigma = state_dict["_recompute_Sigma"]
         self.n_data = state_dict["n_data"]
         self.n_outputs = state_dict["n_outputs"]
         setattr(self.model, "output_size", self.n_outputs)

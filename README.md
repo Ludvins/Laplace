@@ -14,6 +14,10 @@
 
 The laplace package facilitates the application of Laplace approximations for entire neural networks, subnetworks of neural networks, or just their last layer.
 The package enables posterior approximations, marginal-likelihood estimation, and various posterior predictive computations.
+It also includes ELLA and VaLLA as function-space estimators. Select them
+through `Laplace` with `hessian_structure="gp"` and
+`functional_approximation="nystrom"` or `"variational"`; see the
+[guide](docs/ella_valla.md).
 
 There is also a corresponding paper, [_Laplace Redux — Effortless Bayesian Deep Learning_](https://arxiv.org/abs/2106.14806), which introduces the library, provides an introduction to the Laplace approximation, reviews its use in deep learning, and empirically demonstrates its versatility and competitiveness. Please consider referring to the paper when using our library:
 

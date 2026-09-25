@@ -166,6 +166,35 @@ class CurvatureInterface:
 
         return (Js, f) if enable_backprop else (Js.detach(), f.detach())
 
+    def selected_output_jacobians(
+        self,
+        x: torch.Tensor | MutableMapping[str, torch.Tensor | Any],
+        outputs: torch.Tensor,
+        enable_backprop: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return parameter Jacobians for selected output coordinates per input.
+
+        The default works with every backend that implements `jacobians`. Backends
+        may override it to avoid materializing all output coordinates.
+        """
+        # Use the output shape observed at this input. Reward models return two
+        # training logits but one output for an individual inference input.
+        jacobians, values = CurvatureInterface.jacobians(
+            self, x, enable_backprop=enable_backprop
+        )
+        if outputs.ndim == 1:
+            outputs = outputs[:, None]
+        if outputs.shape[0] != jacobians.shape[0]:
+            raise ValueError("Output selectors must match the input batch size.")
+        selected = torch.gather(
+            jacobians,
+            dim=1,
+            index=outputs.to(jacobians.device, dtype=torch.long)
+            .unsqueeze(-1)
+            .expand(-1, -1, jacobians.shape[-1]),
+        )
+        return selected, values
+
     def gradients(
         self, x: torch.Tensor | MutableMapping[str, torch.Tensor | Any], y: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:

@@ -601,7 +601,7 @@ wheels = [
 
 [[package]]
 name = "laplace-torch"
-version = "0.2.2.2"
+version = "0.2.3"
 source = { editable = "." }
 dependencies = [
     { name = "asdfghjkl" },
@@ -609,9 +609,11 @@ dependencies = [
     { name = "curvlinops-for-pytorch" },
     { name = "numpy" },
     { name = "opt-einsum" },
+    { name = "scipy" },
     { name = "torch" },
     { name = "torchmetrics" },
     { name = "torchvision" },
+    { name = "tqdm" },
 ]
 
 [package.optional-dependencies]
@@ -646,10 +648,12 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'" },
     { name = "pytest-mock", marker = "extra == 'dev'" },
     { name = "ruff", marker = "extra == 'dev'" },
+    { name = "scipy", specifier = ">=1.12" },
     { name = "scipy", marker = "extra == 'dev'" },
     { name = "torch", specifier = ">=2.0" },
     { name = "torchmetrics" },
     { name = "torchvision", specifier = ">=0.15" },
+    { name = "tqdm", specifier = ">=4.66" },
 ]
 
 [package.metadata.requires-dev]
