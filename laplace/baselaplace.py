@@ -694,31 +694,22 @@ class BaseLaplace:
                 return torch.ones_like(f_mu)
             raw_mu, raw_var = f_mu, f_var
 
-            # Condition on the logit sum when it has positive variance. When
-            # that sum is deterministic, the covariance is already centered;
-            # only the mean needs a shift, which leaves softmax unchanged.
+            # A zero-sum covariance is already centered and needs no correction.
             row_sums = f_var.sum(dim=-1)
-            sum_variance = row_sums.sum(dim=-1, keepdim=True)
-            cutoff = torch.finfo(f_var.dtype).eps * f_var.abs().sum(
-                dim=(1, 2), keepdim=True
-            ).squeeze(-1)
-            centered = sum_variance.abs() <= cutoff
-            safe_variance = torch.where(
-                centered, torch.ones_like(sum_variance), sum_variance
+            sum_variance = f_var.sum(dim=(1, 2), keepdim=True)
+            centered = sum_variance.abs() <= (
+                torch.finfo(f_var.dtype).eps * f_var.abs().sum(dim=(1, 2), keepdim=True)
             )
-            mean_shift = torch.where(
-                centered,
+            safe_variance = torch.where(centered, 1, sum_variance)
+            f_mu = f_mu - torch.where(
+                centered.squeeze(-1),
                 f_mu.mean(dim=-1, keepdim=True),
-                row_sums * f_mu.sum(dim=-1, keepdim=True) / safe_variance,
+                row_sums * f_mu.sum(dim=-1, keepdim=True) / safe_variance.squeeze(-1),
             )
-            f_mu = f_mu - mean_shift
-            covariance_correction = (
-                row_sums.unsqueeze(-1) * row_sums.unsqueeze(-2)
-            ) / safe_variance.unsqueeze(-1)
             f_var = f_var - torch.where(
-                centered.unsqueeze(-1),
-                torch.zeros_like(covariance_correction),
-                covariance_correction,
+                centered,
+                0,
+                row_sums.unsqueeze(-1) * row_sums.unsqueeze(-2) / safe_variance,
             )
             f_var_diag = f_var.diagonal(dim1=-2, dim2=-1)
             valid_variance = (f_var_diag > 0).all(dim=-1, keepdim=True)
@@ -726,16 +717,11 @@ class BaseLaplace:
             if link_approx == LinkApprox.BRIDGE_NORM:
                 variance_scale = f_var_diag.mean(dim=-1, keepdim=True) / sqrt(K / 2)
                 valid_variance &= variance_scale > 0
-                safe_scale = torch.where(
-                    variance_scale > 0,
-                    variance_scale,
-                    torch.ones_like(variance_scale),
-                )
+                safe_scale = torch.where(variance_scale > 0, variance_scale, 1)
                 f_mu = f_mu / safe_scale.sqrt()
                 f_var_diag = f_var_diag / safe_scale
 
-            # Eq. (7) of the Laplace Bridge, normalized in log space to avoid
-            # overflow from large logits or very small positive variances.
+            # Normalize the Bridge's Dirichlet parameters in log space.
             log_component = (
                 f_mu + torch.logsumexp(-f_mu, dim=-1, keepdim=True) - 2 * log(K)
             )
@@ -752,10 +738,8 @@ class BaseLaplace:
             fallback = torch.softmax(
                 raw_mu / torch.sqrt(1 + np.pi / 8 * fallback_variance), dim=-1
             )
-            valid = valid_variance & torch.isfinite(probabilities).all(
-                dim=-1, keepdim=True
-            )
-            return torch.where(valid, probabilities, fallback)
+            valid_variance &= torch.isfinite(probabilities).all(dim=-1, keepdim=True)
+            return torch.where(valid_variance, probabilities, fallback)
         else:
             raise ValueError(
                 "Prediction path invalid. Check the likelihood, pred_type, link_approx combination!"
