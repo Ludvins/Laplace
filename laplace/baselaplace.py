@@ -31,7 +31,7 @@ from laplace._functional_utils import (
     to_device,
     training_indices,
 )
-from laplace.curvature.asdfghjkl import AsdfghjklHessian
+from laplace.curvature.asdfghjkl import AsdfghjklHessian, AsdfghjklInterface
 from laplace.curvature.asdl import AsdlGGN, AsdlInterface
 from laplace.curvature.backpack import BackPackGGN, BackPackInterface
 from laplace.curvature.curvature import CurvatureInterface
@@ -159,9 +159,8 @@ class BaseLaplace:
         if backend is None:
             backend = CurvlinopsGGN
         else:
-            if self.is_subset_params and (
-                "backpack" in backend.__name__.lower()
-                or "asdfghjkl" in backend.__name__.lower()
+            if self.is_subset_params and issubclass(
+                backend, (BackPackInterface, AsdfghjklInterface)
             ):
                 raise ValueError(
                     "If some grad are switched off, the BackPACK and Asdfghjkl backends"
@@ -2223,11 +2222,17 @@ class BaseFunctionalLaplace(BaseLaplace):
             raise RuntimeError("Call fit before making functional Laplace predictions.")
         self._refresh_posterior()
 
+    def _check_nonempty_inputs(self, x: torch.Tensor | MutableMapping) -> None:
+        inputs = x[self.dict_key_x] if isinstance(x, MutableMapping) else x
+        if inputs.shape[0] == 0:
+            raise ValueError("Function-space predictions require at least one input.")
+
     def predictive_moments(
         self, x: torch.Tensor | MutableMapping, *, joint: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return latent output mean and covariance in model-output units."""
         self._check_fitted()
+        self._check_nonempty_inputs(x)
         return self._glm_predictive_distribution(x, joint=joint)
 
     def __call__(
@@ -2253,6 +2258,7 @@ class BaseFunctionalLaplace(BaseLaplace):
         supported; use `functional_samples` for latent draws.
         """
         self._check_fitted()
+        self._check_nonempty_inputs(x)
         if pred_type != PredType.GP:
             raise ValueError("Only gp is supported as a functional prediction type.")
         if link_approx not in list(LinkApprox):
@@ -2336,6 +2342,7 @@ class BaseFunctionalLaplace(BaseLaplace):
         posterior; `"nn"` does not sample model weights.
         """
         self._check_fitted()
+        self._check_nonempty_inputs(x)
         if pred_type not in list(PredType):
             raise ValueError(f"Unsupported functional sampling type {pred_type}.")
         if n_samples <= 0:
@@ -3658,6 +3665,8 @@ class ELLA(BaseFunctionalLaplace):
         balanced: bool = False,
         progress_bar: bool = False,
     ) -> None:
+        if val_steps is not None and val_steps <= 0:
+            raise ValueError("val_steps must be positive when provided.")
         self.model.eval()
         self.fit_history_ = {"processed_examples": [], "val_nll": [], "tuning": []}
         self._fitted = False
@@ -4231,21 +4240,22 @@ class VaLLA(BaseFunctionalLaplace):
         )
         return selected[:, 0, :]
 
-    def _inducing_term(
+    def _inducing_factor(
         self, jacobians: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # In float32, adding the identity to a large kernel can round it away
-        # and make an otherwise positive definite system appear singular.
-        work_dtype = (
-            torch.float64 if jacobians.dtype != torch.float64 else jacobians.dtype
-        )
-        jacobians = jacobians.to(work_dtype)
-        kernel = jacobians @ jacobians.T / self.prior_precision.to(work_dtype)
+        """Factor the inducing system without forming an ill-conditioned Gram matrix."""
+        work_dtype = torch.float64
+        prior_scale = self.prior_precision.to(work_dtype).sqrt()
+        inducing = jacobians.to(work_dtype)
         factor = self._factor_matrix().to(work_dtype)
-        identity = torch.eye(self.num_inducing, device=self._device, dtype=work_dtype)
-        hessian = identity + factor.T @ kernel @ factor
-        correction = factor @ torch.linalg.solve(hessian, factor.T)
-        return kernel, hessian, correction
+        features = factor.T @ inducing / prior_scale
+        identity = torch.eye(
+            self.num_inducing, device=features.device, dtype=work_dtype
+        )
+        basis, triangular = torch.linalg.qr(
+            torch.cat((features.T, identity), dim=0), mode="reduced"
+        )
+        return features, basis, triangular
 
     def _posterior_covariance(
         self,
@@ -4253,79 +4263,41 @@ class VaLLA(BaseFunctionalLaplace):
         inducing_jacobians: torch.Tensor,
         *,
         joint: bool,
+        basis: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Form a PSD covariance without subtracting nearly equal kernels."""
-        work_dtype = (
-            torch.float64 if jacobians.dtype != torch.float64 else jacobians.dtype
-        )
-        prior_scale = self.prior_precision.to(work_dtype).sqrt()
-        query = jacobians.to(work_dtype).reshape(-1, self.n_params) / prior_scale
-        inducing = inducing_jacobians.to(work_dtype)
-        factor = self._factor_matrix().to(work_dtype)
-        feature_map = (factor.T @ inducing / prior_scale).T
-        basis, triangular = torch.linalg.qr(feature_map, mode="reduced")
-
-        # QR derivatives are undefined for a rank-deficient feature map. The
-        # double-precision Woodbury form remains differentiable in that case.
-        diagonal = triangular.diagonal()
-        tolerance = (
-            torch.finfo(work_dtype).eps
-            * max(triangular.shape)
-            * torch.linalg.vector_norm(triangular.detach())
-        )
-        if torch.any(diagonal.abs() <= tolerance):
-            projected = query @ feature_map
-            small = (
-                torch.eye(feature_map.shape[1], device=query.device, dtype=work_dtype)
-                + feature_map.T @ feature_map
-            )
-            solved = torch.linalg.solve(small, projected.T).T
-            if joint:
-                covariance = query @ query.T - projected @ solved.T
-            else:
-                batch, outputs = jacobians.shape[:2]
-                query = query.reshape(batch, outputs, -1)
-                projected = projected.reshape(batch, outputs, -1)
-                solved = solved.reshape(batch, outputs, -1)
-                covariance = torch.einsum("bcp,bdp->bcd", query, query)
-                covariance -= torch.einsum("bcm,bdm->bcd", projected, solved)
+        """Form a PSD covariance using the orthogonal inducing complement."""
+        if basis is None:
+            _, basis, _ = self._inducing_factor(inducing_jacobians)
+        prior_scale = self.prior_precision.to(torch.float64).sqrt()
+        query = jacobians.to(torch.float64).reshape(-1, self.n_params) / prior_scale
+        padded = torch.nn.functional.pad(query, (0, self.num_inducing))
+        roots = padded - (padded @ basis) @ basis.T
+        if joint:
+            covariance = roots @ roots.T
         else:
-            projected = query @ basis
-            residual = query - projected @ basis.T
-            small = (
-                torch.eye(triangular.shape[0], device=query.device, dtype=work_dtype)
-                + triangular @ triangular.T
-            )
-            scaled = torch.linalg.solve_triangular(
-                torch.linalg.cholesky(small), projected.T, upper=False
-            ).T
-            roots = torch.cat((residual, scaled), dim=-1)
-            if joint:
-                covariance = roots @ roots.T
-            else:
-                batch, outputs = jacobians.shape[:2]
-                roots = roots.reshape(batch, outputs, -1)
-                covariance = torch.einsum("bcp,bdp->bcd", roots, roots)
+            batch, outputs = jacobians.shape[:2]
+            roots = roots.reshape(batch, outputs, -1)
+            covariance = torch.einsum("bcp,bdp->bcd", roots, roots)
         covariance = (covariance + covariance.transpose(-1, -2)) / 2
         return covariance.to(jacobians.dtype)
 
     def _latent_distribution(
         self, x: torch.Tensor | MutableMapping, joint: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         x = to_device(x, self._device, self._dtype)
         jacobians, mean = self._query_jacobians(x, differentiable=self.enable_backprop)
         inducing_jacobians = self._inducing_jacobians()
-        kernel_zz, hessian, correction = self._inducing_term(inducing_jacobians)
+        features, basis, triangular = self._inducing_factor(inducing_jacobians)
         covariance = self._posterior_covariance(
-            jacobians, inducing_jacobians, joint=joint
+            jacobians, inducing_jacobians, joint=joint, basis=basis
         )
-        return mean, covariance, kernel_zz, hessian, correction
+        return mean, covariance, features, triangular
 
     @torch.enable_grad()
     def _glm_predictive_distribution(
         self, x: torch.Tensor | MutableMapping, joint: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        mean, covariance, _, _, _ = self._latent_distribution(x, joint)
+        mean, covariance, _, _ = self._latent_distribution(x, joint)
         if joint:
             mean = mean.flatten()
         if not self.enable_backprop:
@@ -4345,7 +4317,7 @@ class VaLLA(BaseFunctionalLaplace):
         return self._posterior_covariance(jacobians, inducing, joint=True)
 
     def _objective(self, x: Any, y: torch.Tensor) -> torch.Tensor:
-        mean, covariance, kernel, hessian, correction = self._latent_distribution(x)
+        mean, covariance, features, triangular = self._latent_distribution(x)
         if self.likelihood == Likelihood.REGRESSION:
             y = regression_targets(y, mean)
             noise_variance = self.sigma_noise.square()
@@ -4391,9 +4363,8 @@ class VaLLA(BaseFunctionalLaplace):
                 log_term = -torch.nn.functional.cross_entropy(
                     scaled, y.long(), reduction="sum"
                 )
-        kl = 0.5 * (
-            torch.linalg.slogdet(hessian).logabsdet - torch.trace(kernel @ correction)
-        )
+        solved = torch.linalg.solve_triangular(triangular.T, features, upper=False)
+        kl = triangular.diagonal().abs().log().sum() - 0.5 * solved.square().sum()
         return -(self.n_data / y.shape[0]) * log_term / self.temperature + kl
 
     def _validation_nll(self, loader: DataLoader) -> torch.Tensor:
@@ -4441,6 +4412,8 @@ class VaLLA(BaseFunctionalLaplace):
     ) -> None:
         if iterations <= 0 or lr <= 0:
             raise ValueError("iterations and lr must be positive.")
+        if val_steps is not None and val_steps <= 0:
+            raise ValueError("val_steps must be positive when provided.")
         if self.temperature <= 0:
             raise ValueError("temperature must be positive.")
         if not 0 <= self.alpha <= 1:

@@ -473,9 +473,7 @@ def test_valla_regression_alpha_energy(data, alpha):
     )
     estimator.fit(loader, iterations=1)
     inputs, targets = next(iter(loader))
-    mean, covariance, kernel, hessian, correction = estimator._latent_distribution(
-        inputs
-    )
+    mean, covariance, features, _ = estimator._latent_distribution(inputs)
     noise_variance = estimator.sigma_noise.square()
     latent_variance = covariance.diagonal(dim1=-2, dim2=-1)
     if alpha == 0:
@@ -485,8 +483,10 @@ def test_valla_regression_alpha_energy(data, alpha):
             noise_variance + alpha * latent_variance
         ) + torch.log1p(alpha * latent_variance / noise_variance) / alpha
     log_term = -0.5 * (energy + torch.log(2 * torch.pi * noise_variance)).sum()
+    hessian = torch.eye(features.shape[0], dtype=features.dtype) + features @ features.T
     kl = 0.5 * (
-        torch.linalg.slogdet(hessian).logabsdet - torch.trace(kernel @ correction)
+        torch.linalg.slogdet(hessian).logabsdet
+        - torch.trace(torch.linalg.solve(hessian, features @ features.T))
     )
     expected = -(estimator.n_data / len(inputs)) * log_term / estimator.temperature + kl
     torch.testing.assert_close(estimator._objective(inputs, targets), expected)
@@ -1033,7 +1033,7 @@ def test_valla_rank_deficient_inducing_features_keep_finite_gradients():
 
 
 def test_valla_large_duplicate_inducing_features_keep_precision_invertible():
-    scale = 100_000.0
+    scale = 100_000_000.0
     model = torch.nn.Linear(1, 1, bias=False)
     with torch.no_grad():
         model.weight.zero_()
@@ -1047,6 +1047,61 @@ def test_valla_large_duplicate_inducing_features_keep_precision_invertible():
     variance = estimator.predictive_moments(query)[1][0, 0, 0]
     expected = query.square() / (1 + 2 * inducing[0].square())
     torch.testing.assert_close(variance, expected.squeeze(), rtol=1e-4, atol=1e-4)
+    assert torch.isfinite(torch.tensor(estimator.fit_history_["objective"])).all()
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_functional_methods_reject_empty_queries(data, method):
+    x, loader, model = data
+    estimator = (
+        make_ella(model)
+        if method == "nystrom"
+        else make_valla(model, inducing_locations=x[:2].clone())
+    )
+    if method == "nystrom":
+        estimator.fit(loader)
+    else:
+        estimator.fit(loader, iterations=1)
+    for joint in (False, True):
+        with pytest.raises(ValueError, match="at least one input"):
+            estimator.predictive_moments(x[:0], joint=joint)
+        with pytest.raises(ValueError, match="at least one input"):
+            estimator.functional_samples(x[:0], n_samples=2, joint=joint)
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+@pytest.mark.parametrize("val_steps", [0, -1])
+def test_functional_methods_reject_invalid_val_steps(data, method, val_steps):
+    x, loader, model = data
+    estimator = (
+        make_ella(model)
+        if method == "nystrom"
+        else make_valla(model, inducing_locations=x[:2].clone())
+    )
+    with pytest.raises(ValueError, match="val_steps must be positive"):
+        if method == "nystrom":
+            estimator.fit(loader, val_steps=val_steps)
+        else:
+            estimator.fit(loader, iterations=1, val_steps=val_steps)
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_functional_methods_reject_frozen_parameters_with_backpack_subclass(method):
+    class AlternateGGN(BackPackGGN):
+        pass
+
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2))
+    for parameter in model[0].parameters():
+        parameter.requires_grad_(False)
+    with pytest.raises(ValueError, match="BackPACK and Asdfghjkl"):
+        if method == "nystrom":
+            make_ella(model, backend=AlternateGGN)
+        else:
+            make_valla(
+                model,
+                inducing_locations=torch.zeros(2, 2),
+                backend=AlternateGGN,
+            )
 
 
 @pytest.mark.parametrize("method", ["nystrom", "variational"])
