@@ -60,7 +60,7 @@ Classification and reward modeling with another alpha require Monte Carlo
 samples because the probit approximation does not depend on alpha.
 Repeated `fit` calls reset VaLLA's inducing and variational state by default;
 the learned prior precision and regression noise carry over.
-pass `override=False` to continue optimizing the fitted state and append to
+Pass `override=False` to continue optimizing the fitted state and append to
 `fit_history_`.
 
 Both estimators accept `"classification"`, `"regression"`, and
