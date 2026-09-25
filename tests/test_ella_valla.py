@@ -133,6 +133,51 @@ def test_factory_and_unsupported_combinations(data):
         Laplace(model, "classification", "all", "gp", functional_approximation="other")
 
 
+@pytest.mark.parametrize("method", ["sod", "nystrom", "variational", "diag"])
+@pytest.mark.parametrize("link", ["bridge", "bridge_norm"])
+def test_bridge_probabilities_with_zero_sum_logit_covariance(method, link):
+    class ContrastModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([0.5]))
+
+        def forward(self, inputs):
+            logit = inputs * self.weight
+            return torch.cat((logit, -logit), dim=-1)
+
+    inputs = torch.tensor([[1.0], [2.0], [3.0]])
+    loader = DataLoader(TensorDataset(inputs, torch.tensor([0, 1, 0])), batch_size=3)
+    if method == "diag":
+        estimator = Laplace(
+            ContrastModel(), "classification", "all", "diag", backend=CurvlinopsGGN
+        )
+    else:
+        options = {
+            "sod": {"n_subset": 2},
+            "nystrom": {"subsample_size": 2, "n_eigenvalues": 1},
+            "variational": {"inducing_locations": inputs[:1].clone()},
+        }[method]
+        estimator = Laplace(
+            ContrastModel(),
+            "classification",
+            "all",
+            "gp",
+            backend=CurvlinopsGGN,
+            functional_approximation=method,
+            **options,
+        )
+    if method == "variational":
+        estimator.fit(loader, iterations=1)
+    else:
+        estimator.fit(loader)
+    probabilities = estimator(
+        inputs[:1], pred_type="glm" if method == "diag" else "gp", link_approx=link
+    )
+    assert torch.isfinite(probabilities).all()
+    assert torch.all(probabilities >= 0)
+    torch.testing.assert_close(probabilities.sum(dim=-1), torch.ones(1))
+
+
 @pytest.mark.parametrize("method", ["nystrom", "variational"])
 def test_functional_prior_mean_remains_zero(method, data):
     x, _, model = data
