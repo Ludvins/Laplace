@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import warnings
+from collections import deque
 from collections.abc import MutableMapping
+from copy import deepcopy
 from importlib.util import find_spec
 from math import log, pi, sqrt
 from typing import Any, Callable
@@ -10,11 +12,25 @@ import numpy as np
 import torch
 import torchmetrics
 import tqdm
+from scipy.cluster.vq import kmeans2
 from torch import nn
 from torch.linalg import LinAlgError
 from torch.nn.utils import parameters_to_vector, vector_to_parameters
 from torch.utils.data import DataLoader
 
+from laplace._functional_utils import (
+    check_model_fingerprint,
+    classification_targets,
+    individual_reward_inputs,
+    model_fingerprint,
+    preserve_model_gradients,
+    regression_targets,
+    select_rows,
+    split_batch,
+    subset_loader,
+    to_device,
+    training_indices,
+)
 from laplace.curvature.asdfghjkl import AsdfghjklHessian
 from laplace.curvature.asdl import AsdlGGN
 from laplace.curvature.backpack import BackPackGGN
@@ -42,6 +58,8 @@ __all__ = [
     "BaseFunctionalLaplace",
     "ParametricLaplace",
     "FunctionalLaplace",
+    "ELLA",
+    "VaLLA",
     "FullLaplace",
     "KronLaplace",
     "DiagLaplace",
@@ -3321,3 +3339,1184 @@ class FunctionalLaplace(BaseFunctionalLaplace):
         self.likelihood = state_dict["likelihood"]
         self.temperature = state_dict["temperature"]
         self.enable_backprop = state_dict["enable_backprop"]
+
+
+class ELLA(BaseFunctionalLaplace):
+    """Accelerated linearized Laplace using a rank-limited Nyström feature map.
+
+    `subsample_size` selects training inputs for the basis, while
+    `n_eigenvalues` is its retained rank. `fit` accumulates projected GGN
+    curvature and returns `None`. `fit_history_` records processed counts,
+    validation NLL, and optional prior-grid scores. The pretrained model is
+    evaluated without updating its parameters.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        likelihood: Likelihood | str,
+        subsample_size: int,
+        n_eigenvalues: int,
+        sigma_noise: float | torch.Tensor = 1.0,
+        prior_precision: float | torch.Tensor = 1.0,
+        prior_mean: float | torch.Tensor = 0.0,
+        temperature: float = 1.0,
+        enable_backprop: bool = False,
+        dict_key_x: str = "input_ids",
+        dict_key_y: str = "labels",
+        backend: type[CurvatureInterface] | None = None,
+        backend_kwargs: dict[str, Any] | None = None,
+        seed: int = 1234,
+    ) -> None:
+        if subsample_size <= 0 or n_eigenvalues <= 0 or n_eigenvalues > subsample_size:
+            raise ValueError("Require 0 < n_eigenvalues <= subsample_size.")
+        if torch.as_tensor(prior_precision).numel() != 1:
+            raise ValueError("ELLA requires scalar prior_precision.")
+        if torch.any(torch.as_tensor(prior_mean) != 0):
+            raise ValueError("ELLA currently requires prior_mean=0.")
+        if temperature <= 0:
+            raise ValueError("temperature must be positive.")
+        super().__init__(
+            model,
+            likelihood,
+            sigma_noise=sigma_noise,
+            prior_precision=prior_precision,
+            prior_mean=prior_mean,
+            temperature=temperature,
+            enable_backprop=enable_backprop,
+            dict_key_x=dict_key_x,
+            dict_key_y=dict_key_y,
+            backend=backend,
+            backend_kwargs=backend_kwargs,
+        )
+        self.subsample_size = subsample_size
+        self.n_eigenvalues = n_eigenvalues
+        self.seed = seed
+        self.dual_directions: torch.Tensor | None = None
+        self.feature_gram: torch.Tensor | None = None
+        self.chol_precision: torch.Tensor | None = None
+        self._posterior_dirty = False
+        self._fitted = False
+        self.fit_history_: dict[str, list[Any]] = {
+            "processed_examples": [],
+            "val_nll": [],
+            "tuning": [],
+        }
+
+    @property
+    def prior_precision(self) -> torch.Tensor:
+        return self._prior_precision
+
+    @prior_precision.setter
+    def prior_precision(self, value: float | torch.Tensor) -> None:
+        if torch.as_tensor(value).numel() != 1 or torch.any(
+            torch.as_tensor(value) <= 0
+        ):
+            raise ValueError("ELLA requires positive scalar prior_precision.")
+        BaseLaplace.prior_precision.fset(self, value)  # type: ignore[attr-defined]
+        if hasattr(self, "feature_gram") and self.feature_gram is not None:
+            self._posterior_dirty = True
+
+    @property
+    def prior_mean(self) -> torch.Tensor:
+        return self._prior_mean
+
+    @prior_mean.setter
+    def prior_mean(self, value: float | torch.Tensor) -> None:
+        if torch.any(torch.as_tensor(value) != 0):
+            raise ValueError("ELLA currently requires prior_mean=0.")
+        BaseLaplace.prior_mean.fset(self, value)  # type: ignore[attr-defined]
+
+    @property
+    def sigma_noise(self) -> torch.Tensor:
+        return self._sigma_noise
+
+    @sigma_noise.setter
+    def sigma_noise(self, value: float | torch.Tensor) -> None:
+        if torch.any(torch.as_tensor(value) <= 0):
+            raise ValueError("sigma_noise must be positive.")
+        if self.likelihood != Likelihood.REGRESSION and torch.any(
+            torch.as_tensor(value) != 1
+        ):
+            raise ValueError("sigma_noise != 1 is only available for regression.")
+        BaseLaplace.sigma_noise.fset(self, value)  # type: ignore[attr-defined]
+        if hasattr(self, "feature_gram") and self.feature_gram is not None:
+            self._posterior_dirty = True
+
+    @property
+    def temperature(self) -> float:
+        return self._temperature
+
+    @temperature.setter
+    def temperature(self, value: float) -> None:
+        if value <= 0:
+            raise ValueError("temperature must be positive.")
+        self._temperature = value
+        if hasattr(self, "feature_gram") and self.feature_gram is not None:
+            self._posterior_dirty = True
+
+    def _batch(self, batch: Any) -> tuple[Any, torch.Tensor]:
+        x, y = split_batch(batch, self.dict_key_y)
+        return to_device(x, self._device, self._dtype), y.to(self._device)
+
+    def _indices(self, loader: DataLoader, balanced: bool) -> torch.Tensor:
+        available = training_indices(loader)
+        n = len(available)
+        if self.subsample_size > n:
+            raise ValueError("subsample_size cannot exceed the training set size.")
+        generator = torch.Generator().manual_seed(self.seed)
+        if not balanced:
+            chosen = torch.randperm(n, generator=generator)[: self.subsample_size]
+            return available[chosen]
+        if self.likelihood == Likelihood.REGRESSION:
+            raise ValueError("balanced sampling is only defined for classification.")
+        labels = []
+        for index in available:
+            _, target = split_batch(loader.dataset[int(index)], self.dict_key_y)
+            labels.append(
+                int(
+                    torch.as_tensor(target).argmax()
+                    if torch.as_tensor(target).numel() > 1
+                    else target
+                )
+            )
+        labels = torch.tensor(labels)
+        classes = labels.unique(sorted=True)
+        queues = []
+        for cls in classes:
+            candidates = torch.where(labels == cls)[0]
+            order = torch.randperm(len(candidates), generator=generator)
+            queues.append(deque(candidates[order].tolist()))
+        selected: list[int] = []
+        while len(selected) < self.subsample_size and any(queues):
+            for queue in queues:
+                if queue and len(selected) < self.subsample_size:
+                    selected.append(queue.popleft())
+        if len(selected) != self.subsample_size:
+            raise ValueError("Not enough examples for balanced subsampling.")
+        return available[torch.tensor(selected[: self.subsample_size])]
+
+    def _build_basis(self, loader: DataLoader, indices: torch.Tensor) -> None:
+        selected_rows = []
+        generator = torch.Generator().manual_seed(self.seed + 1)
+        for batch in subset_loader(loader, indices):
+            x, _ = self._batch(batch)
+            if (
+                self.likelihood == Likelihood.REWARD_MODELING
+                and "backpack" not in self._backend_cls.__name__.lower()
+            ):
+                jacobians, outputs = CurvatureInterface.jacobians(self.backend, x)
+            else:
+                jacobians, outputs = self.backend.jacobians(x)
+            choices = torch.randint(
+                outputs.shape[-1], (outputs.shape[0],), generator=generator
+            ).to(jacobians.device)
+            selected_rows.append(
+                jacobians[torch.arange(len(choices), device=jacobians.device), choices]
+            )
+        rows = torch.cat(selected_rows)
+        kernel = rows @ rows.T
+        eigenvalues, eigenvectors = torch.linalg.eigh(kernel)
+        order = torch.argsort(eigenvalues, descending=True)[: self.n_eigenvalues]
+        values = eigenvalues[order]
+        if torch.any(values <= torch.finfo(values.dtype).eps):
+            raise ValueError("Nyström subset kernel has insufficient positive rank.")
+        self.dual_directions = rows.T @ (
+            eigenvectors[:, order] / values.sqrt().unsqueeze(0)
+        )
+
+    def _features(
+        self, x: torch.Tensor | MutableMapping
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.dual_directions is None:
+            raise RuntimeError("Call fit before requesting ELLA features.")
+        # BackPACK extends modules in-place and is incompatible with torch.func.jvp.
+        if "backpack" not in self._backend_cls.__name__.lower():
+            parameters = dict(self.model.named_parameters())
+            buffers = dict(self.model.named_buffers())
+            feature_columns = []
+            for direction in self.dual_directions.T:
+                offset = 0
+                tangents = {}
+                for name, param in parameters.items():
+                    if param.requires_grad:
+                        tangent = direction[offset : offset + param.numel()].reshape_as(
+                            param
+                        )
+                        offset += param.numel()
+                    else:
+                        tangent = torch.zeros_like(param)
+                    tangents[name] = tangent
+
+                def model_fn(params):
+                    return torch.func.functional_call(
+                        self.model, (params, buffers), (x,)
+                    )
+
+                try:
+                    output, product = torch.func.jvp(
+                        model_fn, (parameters,), (tangents,)
+                    )
+                except (NotImplementedError, RuntimeError) as exc:
+                    if "forward AD" not in str(exc) and "jvp" not in str(exc):
+                        raise
+                    break
+                feature_columns.append(product)
+            if len(feature_columns) == self.n_eigenvalues:
+                return torch.stack(feature_columns, dim=-1), output
+        if (
+            self.likelihood == Likelihood.REWARD_MODELING
+            and "backpack" in self._backend_cls.__name__.lower()
+            and (query_shape := self.model(x).shape)[-1] == 1
+        ):
+            selectors = torch.zeros(
+                query_shape[0], device=self._device, dtype=torch.long
+            )
+            jacobians, output = self.backend.selected_output_jacobians(
+                x, selectors, enable_backprop=self.enable_backprop
+            )
+        elif (
+            self.likelihood == Likelihood.REWARD_MODELING
+            and "backpack" not in self._backend_cls.__name__.lower()
+        ):
+            jacobians, output = CurvatureInterface.jacobians(
+                self.backend, x, enable_backprop=self.enable_backprop
+            )
+        else:
+            jacobians, output = self.backend.jacobians(
+                x, enable_backprop=self.enable_backprop
+            )
+        return jacobians @ self.dual_directions, output
+
+    def _refresh_posterior(self) -> None:
+        if self._posterior_dirty:
+            self._build_precision()
+
+    def _build_precision(self) -> None:
+        if self.feature_gram is None:
+            return
+        precision = self.feature_gram / self.temperature
+        if self.likelihood == Likelihood.REGRESSION:
+            precision = precision / self.sigma_noise.square()
+        precision = precision + self.prior_precision * torch.eye(
+            self.n_eigenvalues, device=self._device, dtype=self._dtype
+        )
+        self.chol_precision = torch.linalg.cholesky(precision)
+        self._posterior_dirty = False
+
+    @preserve_model_gradients
+    def fit(
+        self,
+        train_loader: DataLoader,
+        *,
+        val_loader: DataLoader | None = None,
+        val_steps: int | None = None,
+        balanced: bool = False,
+        progress_bar: bool = False,
+    ) -> None:
+        self.model.eval()
+        self.fit_history_ = {"processed_examples": [], "val_nll": [], "tuning": []}
+        self._fitted = False
+        self.n_data = len(training_indices(train_loader))
+        first_x, _ = self._batch(next(iter(train_loader)))
+        if (
+            isinstance(first_x, MutableMapping)
+            and "backpack" in self._backend_cls.__name__.lower()
+        ):
+            raise ValueError(
+                "BackPACK does not support mapping-style inputs; use AsdlGGN or CurvlinopsGGN."
+            )
+        self.n_outputs = self.model(first_x).shape[-1]
+        setattr(self.model, "output_size", self.n_outputs)
+        self._build_basis(train_loader, self._indices(train_loader, balanced))
+        self.feature_gram = torch.zeros(
+            self.n_eigenvalues,
+            self.n_eigenvalues,
+            device=self._device,
+            dtype=self._dtype,
+        )
+        iterator = train_loader
+        if progress_bar:
+            from tqdm import tqdm
+
+            iterator = tqdm(train_loader, desc="Fitting ELLA")
+        processed = 0
+        for step, batch in enumerate(iterator, start=1):
+            x, y = self._batch(batch)
+            features, output = self._features(x)
+            if self.likelihood == Likelihood.REGRESSION:
+                regression_targets(y, output)
+                self.feature_gram += torch.einsum(
+                    "bck,bcl->kl", features, features
+                ).detach()
+            else:
+                probs = output.softmax(dim=-1)
+                hessian = torch.diag_embed(probs) - probs.unsqueeze(
+                    -1
+                ) * probs.unsqueeze(-2)
+                self.feature_gram += torch.einsum(
+                    "bck,bcd,bdl->kl", features, hessian, features
+                ).detach()
+            processed += output.shape[0]
+            self.fit_history_["processed_examples"].append(float(processed))
+            if val_loader is not None and val_steps and step % val_steps == 0:
+                self._build_precision()
+                self._fitted = True
+                self.fit_history_["val_nll"].append(
+                    float(self._validation_nll(val_loader))
+                )
+        self._build_precision()
+        self._fitted = True
+        if val_loader is not None and (not val_steps or step % val_steps):
+            self.fit_history_["val_nll"].append(float(self._validation_nll(val_loader)))
+
+    def _feature_variance(self, features: torch.Tensor) -> torch.Tensor:
+        solved = torch.cholesky_solve(features.transpose(1, 2), self.chol_precision)
+        return features @ solved
+
+    def _feature_covariance(self, features: torch.Tensor) -> torch.Tensor:
+        flat = features.reshape(-1, self.n_eigenvalues)
+        solved = torch.cholesky_solve(flat.T, self.chol_precision)
+        return flat @ solved
+
+    def functional_variance(self, jacobians: torch.Tensor) -> torch.Tensor:
+        """Return per-input covariance from raw parameter Jacobians."""
+        self._check_fitted()
+        self._check_jacobians(jacobians)
+        return self._feature_variance(jacobians @ self.dual_directions)
+
+    def functional_covariance(self, jacobians: torch.Tensor) -> torch.Tensor:
+        """Return joint covariance from raw parameter Jacobians."""
+        self._check_fitted()
+        self._check_jacobians(jacobians)
+        return self._feature_covariance(jacobians @ self.dual_directions)
+
+    @torch.enable_grad()
+    def _glm_predictive_distribution(
+        self, x: torch.Tensor | MutableMapping, joint: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        x = to_device(x, self._device, self._dtype)
+        features, mean = self._features(x)
+        covariance = (
+            self._feature_covariance(features)
+            if joint
+            else self._feature_variance(features)
+        )
+        if joint:
+            mean = mean.flatten()
+        if not self.enable_backprop:
+            return mean.detach(), covariance.detach()
+        return mean, covariance
+
+    def _validation_nll(self, loader: DataLoader) -> torch.Tensor:
+        total = torch.zeros((), device=self._device, dtype=self._dtype)
+        count = 0
+        for batch in loader:
+            x, y = self._batch(batch)
+            if self.likelihood == Likelihood.REGRESSION:
+                mean, covariance = self.predictive_moments(x)
+                y = regression_targets(y, mean)
+                variance = (
+                    covariance.diagonal(dim1=-2, dim2=-1) + self.sigma_noise.square()
+                )
+                total += (
+                    0.5
+                    * (
+                        (y - mean).square() / variance
+                        + variance.log()
+                        + torch.log(torch.as_tensor(2 * torch.pi, device=self._device))
+                    )
+                ).sum()
+            else:
+                probability = self(
+                    x, fitting=self.likelihood == Likelihood.REWARD_MODELING
+                )
+                assert isinstance(probability, torch.Tensor)
+                y = classification_targets(y)
+                total += torch.nn.functional.nll_loss(
+                    probability.log(), y, reduction="sum"
+                )
+            count += y.shape[0]
+        return total / count
+
+    def optimize_prior_precision(
+        self,
+        pred_type: PredType | str = PredType.GP,
+        method: TuningMethod | str = TuningMethod.GRIDSEARCH,
+        n_steps: int = 100,
+        lr: float = 1e-1,
+        init_prior_prec: float | torch.Tensor = 1.0,
+        prior_structure: PriorStructure | str = PriorStructure.SCALAR,
+        val_loader: DataLoader | None = None,
+        loss: Any = None,
+        log_prior_prec_min: float = -4,
+        log_prior_prec_max: float = 4,
+        grid_size: int = 100,
+        link_approx: LinkApprox | str = LinkApprox.PROBIT,
+        n_samples: int = 100,
+        verbose: bool = False,
+        progress_bar: bool = False,
+    ) -> None:
+        self._check_fitted()
+        if pred_type != PredType.GP:
+            raise ValueError("ELLA supports only pred_type='gp'.")
+        if (
+            n_steps != 100
+            or lr != 1e-1
+            or torch.as_tensor(init_prior_prec).numel() != 1
+            or torch.as_tensor(init_prior_prec).item() != 1.0
+            or prior_structure != PriorStructure.SCALAR
+            or loss is not None
+            or link_approx != LinkApprox.PROBIT
+            or n_samples != 100
+            or verbose
+            or progress_bar
+        ):
+            raise NotImplementedError(
+                "ELLA supports validation grid search without marginal-likelihood options."
+            )
+        if method != TuningMethod.GRIDSEARCH:
+            raise NotImplementedError(
+                "ELLA supports validation grid search, not marginal likelihood."
+            )
+        if val_loader is None:
+            raise ValueError("gridsearch requires val_loader.")
+        if grid_size <= 0:
+            raise ValueError("grid_size must be positive.")
+        grid = torch.logspace(log_prior_prec_min, log_prior_prec_max, grid_size)
+        self.optimize_hyperparameters(val_loader, grid)
+
+    def optimize_hyperparameters(self, val_loader: DataLoader, grid) -> None:
+        self._check_fitted()
+        best_score = float("inf")
+        best = None
+        for candidate in grid:
+            if isinstance(candidate, (tuple, list)):
+                self.prior_precision, self.sigma_noise = candidate
+            else:
+                self.prior_precision = candidate
+            score = float(self._validation_nll(val_loader))
+            self.fit_history_["tuning"].append(
+                {
+                    "prior_precision": float(self.prior_precision),
+                    "sigma_noise": float(self.sigma_noise),
+                    "val_nll": score,
+                }
+            )
+            if score < best_score:
+                best_score, best = score, candidate
+        if best is None:
+            raise ValueError("Hyperparameter grid is empty.")
+        if isinstance(best, (tuple, list)):
+            self.prior_precision, self.sigma_noise = best
+        else:
+            self.prior_precision = best
+        self._refresh_posterior()
+
+    def log_marginal_likelihood(self, *args, **kwargs):
+        raise NotImplementedError(
+            "ELLA does not use FunctionalLaplace's subset-of-data marginal likelihood."
+        )
+
+    @property
+    def log_likelihood(self) -> torch.Tensor:
+        raise NotImplementedError("ELLA does not accumulate a training log likelihood.")
+
+    def state_dict(self) -> dict[str, Any]:
+        self._check_fitted()
+        return {
+            "cls_name": type(self).__name__,
+            "n_params": self.n_params,
+            "model_fingerprint": model_fingerprint(self.model),
+            "likelihood": self.likelihood,
+            "subsample_size": self.subsample_size,
+            "n_eigenvalues": self.n_eigenvalues,
+            "dual_directions": self.dual_directions.detach().clone()
+            if self.dual_directions is not None
+            else None,
+            "feature_gram": self.feature_gram.detach().clone()
+            if self.feature_gram is not None
+            else None,
+            "prior_precision": self.prior_precision,
+            "sigma_noise": self.sigma_noise,
+            "temperature": self.temperature,
+            "n_data": self.n_data,
+            "n_outputs": self.n_outputs,
+            "fitted": self._fitted,
+            "fit_history": deepcopy(self.fit_history_),
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        if not state_dict.get("fitted", False):
+            raise ValueError("ELLA checkpoint must contain a fitted posterior.")
+        if (
+            state_dict["cls_name"] != type(self).__name__
+            or state_dict["n_params"] != self.n_params
+        ):
+            raise ValueError(
+                "Checkpoint requires the same ELLA type and pretrained model."
+            )
+        if state_dict["likelihood"] != self.likelihood:
+            raise ValueError("Checkpoint likelihood does not match.")
+        check_model_fingerprint(self.model, state_dict["model_fingerprint"])
+        self.subsample_size = state_dict["subsample_size"]
+        self.n_eigenvalues = state_dict["n_eigenvalues"]
+        self.dual_directions = state_dict["dual_directions"].to(self._device)
+        self.feature_gram = state_dict["feature_gram"].to(self._device)
+        self.prior_precision = state_dict["prior_precision"]
+        self.sigma_noise = state_dict["sigma_noise"]
+        self.temperature = state_dict["temperature"]
+        self.n_data = state_dict["n_data"]
+        self.n_outputs = state_dict["n_outputs"]
+        setattr(self.model, "output_size", self.n_outputs)
+        self._fitted = state_dict["fitted"]
+        self.fit_history_ = deepcopy(state_dict["fit_history"])
+        self._build_precision()
+        self.model.eval()
+
+
+class VaLLA(BaseFunctionalLaplace):
+    """Variational linearized Laplace with inducing outputs and a fixed MAP model.
+
+    `inducing_locations` accepts fixed tensor or mapping inputs, `"random"`,
+    or `"kmeans"`. A strategy requires `num_inducing`. `alpha` is the
+    alpha-divergence parameter in `[0, 1]`; zero uses the ELBO limit.
+    `mc_softmax_samples` enables Monte Carlo classification data terms when
+    positive. `fit` optimizes variational, inducing, prior, and regression
+    noise parameters, returns `None`, and records objective and validation
+    NLL values in `fit_history_`. Repeated fits reset variational and inducing
+    state by default; `fit(..., override=False)` continues optimization.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        likelihood: Likelihood | str,
+        inducing_locations: torch.Tensor | MutableMapping | str,
+        num_inducing: int | None = None,
+        inducing_classes: torch.Tensor | None = None,
+        sigma_noise: float | torch.Tensor = 1.0,
+        prior_precision: float | torch.Tensor = 1.0,
+        prior_mean: float | torch.Tensor = 0.0,
+        temperature: float = 1.0,
+        enable_backprop: bool = False,
+        dict_key_x: str = "input_ids",
+        dict_key_y: str = "labels",
+        backend: type[CurvatureInterface] | None = None,
+        backend_kwargs: dict[str, Any] | None = None,
+        seed: int = 0,
+        alpha: float = 1.0,
+        mc_softmax_samples: int = 0,
+    ) -> None:
+        if torch.as_tensor(prior_precision).numel() != 1:
+            raise ValueError("VaLLA requires scalar prior_precision.")
+        if torch.any(torch.as_tensor(prior_mean) != 0):
+            raise ValueError("VaLLA currently requires prior_mean=0.")
+        if temperature <= 0:
+            raise ValueError("temperature must be positive.")
+        if not 0 <= alpha <= 1:
+            raise ValueError("alpha must be in [0, 1].")
+        if not isinstance(mc_softmax_samples, int) or mc_softmax_samples < 0:
+            raise ValueError("mc_softmax_samples must be a nonnegative integer.")
+        super().__init__(
+            model,
+            likelihood,
+            sigma_noise=sigma_noise,
+            prior_precision=prior_precision,
+            prior_mean=prior_mean,
+            temperature=temperature,
+            enable_backprop=enable_backprop,
+            dict_key_x=dict_key_x,
+            dict_key_y=dict_key_y,
+            backend=backend,
+            backend_kwargs=backend_kwargs,
+        )
+        if (
+            self.likelihood != Likelihood.REGRESSION
+            and alpha != 1
+            and mc_softmax_samples == 0
+        ):
+            raise ValueError(
+                "Classification alpha != 1 requires mc_softmax_samples > 0; "
+                "the deterministic probit approximation is alpha-independent."
+            )
+        self.seed = seed
+        self.alpha = alpha
+        self.mc_softmax_samples = mc_softmax_samples
+        self.generator = torch.Generator(device=self._device).manual_seed(seed)
+        self.log_prior_precision = torch.nn.Parameter(
+            self._prior_precision.detach().log().clone()
+        )
+        self.log_noise_variance = (
+            torch.nn.Parameter(2 * self._sigma_noise.detach().log().clone())
+            if likelihood == Likelihood.REGRESSION
+            else None
+        )
+        self._inducing_strategy = (
+            inducing_locations if isinstance(inducing_locations, str) else None
+        )
+        if self._inducing_strategy is not None and self._inducing_strategy not in {
+            "random",
+            "kmeans",
+        }:
+            raise ValueError(
+                "inducing_locations must be inputs, 'random', or 'kmeans'."
+            )
+        if isinstance(inducing_locations, str):
+            if num_inducing is None or num_inducing <= 0:
+                raise ValueError(
+                    "num_inducing must be positive for an inducing strategy."
+                )
+            self.num_inducing = num_inducing
+            self.inducing_locations = None
+        else:
+            self.inducing_locations = self._make_inducing(inducing_locations)
+            count = (
+                self.inducing_locations[self.dict_key_x].shape[0]
+                if isinstance(self.inducing_locations, MutableMapping)
+                else self.inducing_locations.shape[0]
+            )
+            if num_inducing is not None and num_inducing != count:
+                raise ValueError("num_inducing does not match inducing_locations.")
+            self.num_inducing = count
+        if self.num_inducing <= 0:
+            raise ValueError("At least one inducing location is required.")
+        self.inducing_classes = (
+            torch.zeros(self.num_inducing, device=self._device, dtype=torch.long)
+            if inducing_classes is None
+            else torch.as_tensor(
+                inducing_classes, device=self._device, dtype=torch.long
+            )
+        )
+        if self.inducing_classes.shape != (self.num_inducing,):
+            raise ValueError("inducing_classes must have one entry per inducing input.")
+        self._initial_inducing_locations = (
+            None
+            if self._inducing_strategy is not None
+            else self._clone_fixed_inputs(self.inducing_locations)
+        )
+        self._initial_inducing_classes = self.inducing_classes.detach().clone()
+        self._init_variational_factor()
+        self.n_data = 0
+        self._fitted = False
+        self.fit_history_: dict[str, list[float]] = {"objective": [], "val_nll": []}
+
+    @property
+    def prior_precision(self) -> torch.Tensor:
+        if hasattr(self, "log_prior_precision"):
+            return self.log_prior_precision.exp()
+        return self._prior_precision
+
+    @prior_precision.setter
+    def prior_precision(self, value: float | torch.Tensor) -> None:
+        if torch.as_tensor(value).numel() != 1 or torch.any(
+            torch.as_tensor(value) <= 0
+        ):
+            raise ValueError("VaLLA requires positive scalar prior_precision.")
+        BaseLaplace.prior_precision.fset(self, value)  # type: ignore[attr-defined]
+        if hasattr(self, "log_prior_precision"):
+            with torch.no_grad():
+                self.log_prior_precision.copy_(self._prior_precision.log())
+
+    @property
+    def prior_mean(self) -> torch.Tensor:
+        return self._prior_mean
+
+    @prior_mean.setter
+    def prior_mean(self, value: float | torch.Tensor) -> None:
+        if torch.any(torch.as_tensor(value) != 0):
+            raise ValueError("VaLLA currently requires prior_mean=0.")
+        BaseLaplace.prior_mean.fset(self, value)  # type: ignore[attr-defined]
+
+    @property
+    def sigma_noise(self) -> torch.Tensor:
+        log_noise_variance = getattr(self, "log_noise_variance", None)
+        if isinstance(log_noise_variance, torch.Tensor):
+            return (0.5 * log_noise_variance).exp()
+        return self._sigma_noise
+
+    @sigma_noise.setter
+    def sigma_noise(self, value: float | torch.Tensor) -> None:
+        if torch.any(torch.as_tensor(value) <= 0):
+            raise ValueError("sigma_noise must be positive.")
+        if self.likelihood != Likelihood.REGRESSION and torch.any(
+            torch.as_tensor(value) != 1
+        ):
+            raise ValueError("sigma_noise != 1 is only available for regression.")
+        BaseLaplace.sigma_noise.fset(self, value)  # type: ignore[attr-defined]
+        log_noise_variance = getattr(self, "log_noise_variance", None)
+        if isinstance(log_noise_variance, torch.Tensor):
+            with torch.no_grad():
+                log_noise_variance.copy_(2 * self._sigma_noise.log())
+
+    @staticmethod
+    def _clone_fixed_inputs(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value.detach().clone()
+        if isinstance(value, MutableMapping):
+            return {key: VaLLA._clone_fixed_inputs(item) for key, item in value.items()}
+        if isinstance(value, (tuple, list)):
+            return type(value)(VaLLA._clone_fixed_inputs(item) for item in value)
+        return deepcopy(value)
+
+    def _make_inducing(self, inputs: Any) -> torch.Tensor | dict:
+        converted = to_device(inputs, self._device, self._dtype)
+        if isinstance(converted, MutableMapping):
+            return self._clone_fixed_inputs(converted)
+        if not isinstance(converted, torch.Tensor):
+            converted = torch.as_tensor(
+                converted, device=self._device, dtype=self._dtype
+            )
+        if converted.is_floating_point():
+            return torch.nn.Parameter(converted.detach().clone())
+        return converted.detach().clone()
+
+    def _init_variational_factor(self) -> None:
+        rows, cols = torch.tril_indices(self.num_inducing, self.num_inducing)
+        initial = torch.eye(self.num_inducing, device=self._device, dtype=self._dtype)
+        self.L = torch.nn.Parameter(initial[rows, cols].clone())
+
+    def _factor_matrix(self) -> torch.Tensor:
+        rows, cols = torch.tril_indices(
+            self.num_inducing, self.num_inducing, device=self._device
+        )
+        matrix = torch.zeros(
+            self.num_inducing, self.num_inducing, device=self._device, dtype=self._dtype
+        )
+        matrix[rows, cols] = self.L
+        return matrix
+
+    def _batch(self, batch: Any) -> tuple[Any, torch.Tensor]:
+        x, y = split_batch(batch, self.dict_key_y)
+        return to_device(x, self._device, self._dtype), y.to(self._device)
+
+    def _gather_inducing(self, loader: DataLoader) -> None:
+        candidates = []
+        classes = []
+        source = loader
+        if self._inducing_strategy == "random":
+            available_indices = training_indices(loader)
+            n_pairs = (self.num_inducing + 1) // 2
+            needed = (
+                n_pairs
+                if self.likelihood == Likelihood.REWARD_MODELING
+                else self.num_inducing
+            )
+            count = min(len(available_indices), needed)
+            choices = torch.randperm(
+                len(available_indices),
+                generator=torch.Generator().manual_seed(self.seed),
+            )[:count]
+            indices = available_indices[choices]
+            source = subset_loader(loader, indices)
+        for batch in source:
+            x, y = self._batch(batch)
+            if self.likelihood == Likelihood.REWARD_MODELING:
+                x = individual_reward_inputs(x, self.dict_key_x)
+                labels = torch.zeros(
+                    x[self.dict_key_x].shape[0]
+                    if isinstance(x, MutableMapping)
+                    else x.shape[0],
+                    device=self._device,
+                    dtype=torch.long,
+                )
+            elif self.likelihood == Likelihood.CLASSIFICATION:
+                labels = classification_targets(y)
+            else:
+                labels = torch.zeros(y.shape[0], device=self._device, dtype=torch.long)
+            candidates.append(x)
+            classes.append(labels)
+        if not candidates:
+            raise ValueError("Cannot initialize inducing inputs from an empty loader.")
+        if isinstance(candidates[0], MutableMapping):
+            inputs = {
+                key: torch.cat([candidate[key] for candidate in candidates], dim=0)
+                for key in candidates[0]
+            }
+        else:
+            inputs = torch.cat(candidates, dim=0)
+        labels = torch.cat(classes)
+        available = labels.shape[0]
+        if available < self.num_inducing:
+            raise ValueError("num_inducing exceeds available training inputs.")
+        if self._inducing_strategy == "kmeans":
+            if isinstance(inputs, MutableMapping) or not inputs.is_floating_point():
+                raise ValueError("kmeans requires floating-point tensor inputs.")
+            flat = inputs.detach().cpu().reshape(available, -1).numpy()
+            centers, _ = kmeans2(
+                flat, self.num_inducing, minit="points", seed=self.seed
+            )
+            distances = ((flat[:, None, :] - centers[None, :, :]) ** 2).sum(-1)
+            indices = torch.as_tensor(distances.argmin(0), device=self._device)
+        else:
+            indices = torch.randperm(
+                available, generator=torch.Generator().manual_seed(self.seed)
+            )[: self.num_inducing].to(self._device)
+        self.inducing_locations = self._make_inducing(select_rows(inputs, indices))
+        self.inducing_classes = labels[indices].long()
+
+    def _query_jacobians(
+        self, x: torch.Tensor | MutableMapping, *, differentiable: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if "asdl" in self._backend_cls.__name__.lower() or (
+            self.likelihood == Likelihood.REWARD_MODELING
+            and "backpack" not in self._backend_cls.__name__.lower()
+        ):
+            return CurvatureInterface.jacobians(
+                self.backend, x, enable_backprop=differentiable
+            )
+        output_size = self.model(x).shape[-1]
+        previous = getattr(self.model, "output_size", None)
+        setattr(self.model, "output_size", output_size)
+        try:
+            return self.backend.jacobians(x, enable_backprop=differentiable)
+        finally:
+            if previous is None:
+                delattr(self.model, "output_size")
+            else:
+                setattr(self.model, "output_size", previous)
+
+    def _inducing_jacobians(self) -> torch.Tensor:
+        if self.inducing_locations is None:
+            raise RuntimeError("Inducing locations have not been initialized.")
+        selected, _ = self.backend.selected_output_jacobians(
+            self.inducing_locations,
+            self.inducing_classes,
+            enable_backprop=isinstance(self.inducing_locations, torch.nn.Parameter),
+        )
+        return selected[:, 0, :]
+
+    def _inducing_term(
+        self, jacobians: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        kernel = jacobians @ jacobians.T / self.prior_precision
+        factor = self._factor_matrix()
+        identity = torch.eye(self.num_inducing, device=self._device, dtype=self._dtype)
+        hessian = identity + factor.T @ kernel @ factor
+        correction = factor @ torch.linalg.solve(hessian, factor.T)
+        return kernel, hessian, correction
+
+    def _latent_distribution(
+        self, x: torch.Tensor | MutableMapping, joint: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        x = to_device(x, self._device, self._dtype)
+        jacobians, mean = self._query_jacobians(x, differentiable=self.enable_backprop)
+        inducing_jacobians = self._inducing_jacobians()
+        kernel_zz, hessian, correction = self._inducing_term(inducing_jacobians)
+        if joint:
+            flat = jacobians.reshape(-1, self.n_params)
+            prior = flat @ flat.T / self.prior_precision
+            cross = flat @ inducing_jacobians.T / self.prior_precision
+            covariance = prior - cross @ correction @ cross.T
+        else:
+            prior = (
+                torch.einsum("bcp,bdp->bcd", jacobians, jacobians)
+                / self.prior_precision
+            )
+            cross = (
+                torch.einsum("bcp,mp->bcm", jacobians, inducing_jacobians)
+                / self.prior_precision
+            )
+            covariance = prior - torch.einsum(
+                "bcm,mn,bdn->bcd", cross, correction, cross
+            )
+        covariance = (covariance + covariance.transpose(-1, -2)) / 2
+        return mean, covariance, kernel_zz, hessian, correction
+
+    @torch.enable_grad()
+    def _glm_predictive_distribution(
+        self, x: torch.Tensor | MutableMapping, joint: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        mean, covariance, _, _, _ = self._latent_distribution(x, joint)
+        if joint:
+            mean = mean.flatten()
+        if not self.enable_backprop:
+            return mean.detach(), covariance.detach()
+        return mean, covariance
+
+    def functional_variance(self, jacobians: torch.Tensor) -> torch.Tensor:
+        self._check_fitted()
+        self._check_jacobians(jacobians)
+        inducing = self._inducing_jacobians()
+        _, _, correction = self._inducing_term(inducing)
+        prior = (
+            torch.einsum("bcp,bdp->bcd", jacobians, jacobians) / self.prior_precision
+        )
+        cross = jacobians @ inducing.T / self.prior_precision
+        return prior - torch.einsum("bcm,mn,bdn->bcd", cross, correction, cross)
+
+    def functional_covariance(self, jacobians: torch.Tensor) -> torch.Tensor:
+        self._check_fitted()
+        self._check_jacobians(jacobians)
+        inducing = self._inducing_jacobians()
+        _, _, correction = self._inducing_term(inducing)
+        flat = jacobians.reshape(-1, self.n_params)
+        prior = flat @ flat.T / self.prior_precision
+        cross = flat @ inducing.T / self.prior_precision
+        return prior - cross @ correction @ cross.T
+
+    def _objective(self, x: Any, y: torch.Tensor) -> torch.Tensor:
+        mean, covariance, kernel, hessian, correction = self._latent_distribution(x)
+        if self.likelihood == Likelihood.REGRESSION:
+            y = regression_targets(y, mean)
+            noise_variance = self.sigma_noise.square()
+            latent_variance = covariance.diagonal(dim1=-2, dim2=-1)
+            squared_error = (y - mean).square()
+            if self.alpha == 0:
+                energy = (squared_error + latent_variance) / noise_variance
+            else:
+                energy = (
+                    squared_error / (noise_variance + self.alpha * latent_variance)
+                    + torch.log1p(self.alpha * latent_variance / noise_variance)
+                    / self.alpha
+                )
+            log_term = -0.5 * (energy + torch.log(2 * torch.pi * noise_variance)).sum()
+        else:
+            y = classification_targets(y)
+            if self.mc_softmax_samples:
+                draws = self._draw_gaussian(
+                    mean, covariance, self.mc_softmax_samples, self.generator
+                )
+                log_probabilities = draws.log_softmax(dim=-1)
+                selected = log_probabilities.gather(
+                    -1,
+                    y.long().view(1, -1, 1).expand(self.mc_softmax_samples, -1, 1),
+                ).squeeze(-1)
+                if self.alpha == 0:
+                    log_term = selected.mean(dim=0).sum()
+                else:
+                    log_term = (
+                        torch.logsumexp(self.alpha * selected, dim=0)
+                        - torch.log(
+                            torch.as_tensor(
+                                self.mc_softmax_samples,
+                                device=self._device,
+                                dtype=self._dtype,
+                            )
+                        )
+                    ).sum() / self.alpha
+            else:
+                scaled = mean / torch.sqrt(
+                    1 + torch.pi / 8 * covariance.diagonal(dim1=-2, dim2=-1)
+                )
+                log_term = -torch.nn.functional.cross_entropy(
+                    scaled, y.long(), reduction="sum"
+                )
+        kl = 0.5 * (
+            torch.linalg.slogdet(hessian).logabsdet - torch.trace(kernel @ correction)
+        )
+        return -(self.n_data / y.shape[0]) * log_term / self.temperature + kl
+
+    def _validation_nll(self, loader: DataLoader) -> torch.Tensor:
+        total = torch.zeros((), device=self._device, dtype=self._dtype)
+        count = 0
+        for batch in loader:
+            x, y = self._batch(batch)
+            if self.likelihood == Likelihood.REGRESSION:
+                mean, covariance = self.predictive_moments(x)
+                y = regression_targets(y, mean)
+                variance = (
+                    covariance.diagonal(dim1=-2, dim2=-1) + self.sigma_noise.square()
+                )
+                total += (
+                    0.5
+                    * (
+                        (y - mean).square() / variance
+                        + variance.log()
+                        + torch.log(torch.as_tensor(2 * torch.pi, device=self._device))
+                    )
+                ).sum()
+            else:
+                probability = self(
+                    x, fitting=self.likelihood == Likelihood.REWARD_MODELING
+                )
+                assert isinstance(probability, torch.Tensor)
+                y = classification_targets(y)
+                total += torch.nn.functional.nll_loss(
+                    probability.log(), y, reduction="sum"
+                )
+            count += y.shape[0]
+        return total / count
+
+    @preserve_model_gradients
+    def fit(
+        self,
+        train_loader: DataLoader,
+        *,
+        iterations: int = 100,
+        lr: float = 1e-3,
+        val_loader: DataLoader | None = None,
+        val_steps: int | None = None,
+        progress_bar: bool = False,
+        override: bool = True,
+    ) -> None:
+        if iterations <= 0 or lr <= 0:
+            raise ValueError("iterations and lr must be positive.")
+        if self.temperature <= 0:
+            raise ValueError("temperature must be positive.")
+        if not 0 <= self.alpha <= 1:
+            raise ValueError("alpha must be in [0, 1].")
+        if not isinstance(self.mc_softmax_samples, int) or self.mc_softmax_samples < 0:
+            raise ValueError("mc_softmax_samples must be a nonnegative integer.")
+        if (
+            self.likelihood != Likelihood.REGRESSION
+            and self.alpha != 1
+            and self.mc_softmax_samples == 0
+        ):
+            raise ValueError(
+                "Classification alpha != 1 requires mc_softmax_samples > 0."
+            )
+        self.model.eval()
+        self.n_data = len(training_indices(train_loader))
+        x_first, _ = self._batch(next(iter(train_loader)))
+        if (
+            isinstance(x_first, MutableMapping)
+            and "backpack" in self._backend_cls.__name__.lower()
+        ):
+            raise ValueError(
+                "BackPACK does not support mapping-style inputs; use AsdlGGN or CurvlinopsGGN."
+            )
+        self.n_outputs = self.model(x_first).shape[-1]
+        setattr(self.model, "output_size", self.n_outputs)
+        if override or not self._fitted:
+            if self._inducing_strategy is not None:
+                self._gather_inducing(train_loader)
+            else:
+                self.inducing_locations = self._make_inducing(
+                    self._initial_inducing_locations
+                )
+                self.inducing_classes = self._initial_inducing_classes.detach().clone()
+            self._init_variational_factor()
+            self.fit_history_ = {"objective": [], "val_nll": []}
+        if (
+            self.inducing_classes.shape != (self.num_inducing,)
+            or torch.any(self.inducing_classes < 0)
+            or torch.any(self.inducing_classes >= self.n_outputs)
+        ):
+            raise ValueError(
+                "inducing_classes must contain one valid output per inducing input."
+            )
+        self._fitted = False
+        parameters = [self.L, self.log_prior_precision]
+        if self.log_noise_variance is not None:
+            parameters.append(self.log_noise_variance)
+        if isinstance(self.inducing_locations, torch.nn.Parameter):
+            parameters.append(self.inducing_locations)
+        optimizer = torch.optim.Adam(parameters, lr=lr)
+        iterator = range(iterations)
+        if progress_bar:
+            from tqdm import trange
+
+            iterator = trange(iterations, desc="Fitting VaLLA")
+        batches = iter(train_loader)
+        for step in iterator:
+            try:
+                batch = next(batches)
+            except StopIteration:
+                batches = iter(train_loader)
+                batch = next(batches)
+            x, y = self._batch(batch)
+            optimizer.zero_grad()
+            objective = self._objective(x, y)
+            objective.backward()
+            optimizer.step()
+            self.fit_history_["objective"].append(float(objective.detach()))
+            if val_loader is not None and val_steps and (step + 1) % val_steps == 0:
+                self._fitted = True
+                with torch.no_grad():
+                    self.fit_history_["val_nll"].append(
+                        float(self._validation_nll(val_loader))
+                    )
+        self._fitted = True
+        if val_loader is not None and (not val_steps or iterations % val_steps):
+            with torch.no_grad():
+                self.fit_history_["val_nll"].append(
+                    float(self._validation_nll(val_loader))
+                )
+
+    def optimize_prior_precision(self, *args, **kwargs) -> None:
+        raise NotImplementedError("VaLLA optimizes prior precision during fit.")
+
+    def log_marginal_likelihood(self, *args, **kwargs):
+        raise NotImplementedError(
+            "VaLLA's variational objective is not a Laplace marginal likelihood."
+        )
+
+    @property
+    def log_likelihood(self) -> torch.Tensor:
+        raise NotImplementedError("VaLLA optimizes an alpha-divergence objective.")
+
+    def state_dict(self) -> dict[str, Any]:
+        self._check_fitted()
+        return {
+            "cls_name": type(self).__name__,
+            "n_params": self.n_params,
+            "model_fingerprint": model_fingerprint(self.model),
+            "likelihood": self.likelihood,
+            "inducing_locations": self.inducing_locations.detach().clone()
+            if isinstance(self.inducing_locations, torch.Tensor)
+            else deepcopy(self.inducing_locations),
+            "inducing_classes": self.inducing_classes.detach().clone(),
+            "inducing_strategy": self._inducing_strategy,
+            "initial_inducing_locations": self._clone_fixed_inputs(
+                self._initial_inducing_locations
+            ),
+            "initial_inducing_classes": self._initial_inducing_classes.detach().clone(),
+            "L": self.L.detach().clone(),
+            "log_prior_precision": self.log_prior_precision.detach().clone(),
+            "log_noise_variance": None
+            if self.log_noise_variance is None
+            else self.log_noise_variance.detach().clone(),
+            "temperature": self.temperature,
+            "alpha": self.alpha,
+            "mc_softmax_samples": self.mc_softmax_samples,
+            "n_data": self.n_data,
+            "n_outputs": self.n_outputs,
+            "fitted": self._fitted,
+            "fit_history": deepcopy(self.fit_history_),
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        if not state_dict.get("fitted", False):
+            raise ValueError("VaLLA checkpoint must contain a fitted posterior.")
+        if (
+            state_dict["cls_name"] != type(self).__name__
+            or state_dict["n_params"] != self.n_params
+        ):
+            raise ValueError(
+                "Checkpoint requires the same VaLLA type and pretrained model."
+            )
+        if state_dict["likelihood"] != self.likelihood:
+            raise ValueError("Checkpoint likelihood does not match.")
+        check_model_fingerprint(self.model, state_dict["model_fingerprint"])
+        self.inducing_locations = self._make_inducing(state_dict["inducing_locations"])
+        self.inducing_classes = state_dict["inducing_classes"].to(self._device)
+        self.num_inducing = len(self.inducing_classes)
+        self._inducing_strategy = state_dict["inducing_strategy"]
+        self._initial_inducing_locations = self._clone_fixed_inputs(
+            to_device(
+                state_dict["initial_inducing_locations"], self._device, self._dtype
+            )
+        )
+        self._initial_inducing_classes = state_dict["initial_inducing_classes"].to(
+            self._device
+        )
+        self._init_variational_factor()
+        with torch.no_grad():
+            self.L.copy_(state_dict["L"].to(self._device))
+            self.log_prior_precision.copy_(
+                state_dict["log_prior_precision"].to(self._device)
+            )
+            if self.log_noise_variance is not None:
+                self.log_noise_variance.copy_(
+                    state_dict["log_noise_variance"].to(self._device)
+                )
+        self.n_data = state_dict["n_data"]
+        self.n_outputs = state_dict["n_outputs"]
+        self.temperature = state_dict["temperature"]
+        self.alpha = state_dict["alpha"]
+        self.mc_softmax_samples = state_dict["mc_softmax_samples"]
+        setattr(self.model, "output_size", self.n_outputs)
+        self._fitted = state_dict["fitted"]
+        self.fit_history_ = deepcopy(state_dict["fit_history"])
+        self.model.eval()

@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import torch
 
-from laplace.baselaplace import BaseLaplace
-from laplace.ella import ELLA
+from laplace.baselaplace import ELLA, BaseLaplace, VaLLA
 from laplace.utils.enums import (
     FunctionalApproximation,
     HessianStructure,
     Likelihood,
     SubsetOfWeights,
 )
-from laplace.valla import VaLLA
 
 
 def Laplace(

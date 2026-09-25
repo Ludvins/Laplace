@@ -1,3 +1,3 @@
 # VaLLA
 
-::: laplace.valla.VaLLA
+::: laplace.baselaplace.VaLLA
