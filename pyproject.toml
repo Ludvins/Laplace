@@ -25,6 +25,8 @@ dependencies = [
   "backpack-for-pytorch",
   "curvlinops-for-pytorch >= 2.0",
   "numpy",
+  "scipy >= 1.12",
+  "tqdm >= 4.66",
   "opt_einsum",
   "torch >= 2.0",
   "torchmetrics",

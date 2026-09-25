@@ -1,0 +1,997 @@
+"""CPU contracts for the function-space ELLA and VaLLA estimators."""
+
+from copy import deepcopy
+
+import pytest
+import torch
+from torch.utils.data import (
+    BatchSampler,
+    DataLoader,
+    SequentialSampler,
+    SubsetRandomSampler,
+    TensorDataset,
+)
+
+from laplace import ELLA, FunctionalLaplace, Laplace, VaLLA
+from laplace.curvature import AsdlGGN, BackPackGGN, CurvlinopsGGN
+
+torch.set_num_threads(1)
+
+
+@pytest.fixture
+def data():
+    torch.manual_seed(7)
+    x = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+    y = torch.tensor([0, 1, 1, 0])
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    return x, DataLoader(TensorDataset(x, y), batch_size=2), model
+
+
+def make_ella(model, likelihood="classification", **kwargs):
+    options = {"subsample_size": 2, "n_eigenvalues": 1}
+    options.update(kwargs)
+    return Laplace(
+        model,
+        likelihood,
+        subset_of_weights="all",
+        hessian_structure="gp",
+        functional_approximation="nystrom",
+        **options,
+    )
+
+
+def make_valla(model, likelihood="classification", **kwargs):
+    return Laplace(
+        model,
+        likelihood,
+        subset_of_weights="all",
+        hessian_structure="gp",
+        functional_approximation="variational",
+        **kwargs,
+    )
+
+
+def test_seeded_legacy_ella_map_mean_reference():
+    """Preserve the MAP mean from BayesiPy's ELLA at commit 5ee24ed.
+
+    The former basis kernel omitted diagonal blocks, so its uncertainty is
+    intentionally not a reference for this implementation.
+    """
+    torch.set_num_threads(1)
+    inputs = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+    targets = torch.tensor([0, 1, 1, 0])
+    model = torch.nn.Linear(2, 2)
+    with torch.no_grad():
+        model.weight.copy_(torch.tensor([[0.4, -0.2], [-0.1, 0.3]]))
+        model.bias.copy_(torch.tensor([0.2, -0.3]))
+    loader = DataLoader(TensorDataset(inputs, targets), batch_size=2)
+    estimator = make_ella(
+        model,
+        subsample_size=4,
+        n_eigenvalues=1,
+        seed=11,
+        backend=BackPackGGN,
+    )
+    assert estimator.fit(loader) is None
+    mean, _ = estimator.predictive_moments(inputs[:2])
+    expected = torch.tensor([[0.2, -0.3], [0.6, -0.4]])
+    torch.testing.assert_close(mean, expected)
+
+
+def test_seeded_legacy_valla_regression_reference():
+    """Match BayesiPy's VaLLA fit and latent moments at commit 5ee24ed."""
+    torch.set_num_threads(1)
+    inputs = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+    targets = inputs.sum(dim=-1, keepdim=True)
+    model = torch.nn.Sequential(torch.nn.Linear(2, 1))
+    with torch.no_grad():
+        model[0].weight.copy_(torch.tensor([[0.4, -0.2]]))
+        model[0].bias.copy_(torch.tensor([0.3]))
+    loader = DataLoader(TensorDataset(inputs, targets), batch_size=2)
+    estimator = make_valla(
+        model,
+        "regression",
+        inducing_locations=inputs[:2].clone(),
+        sigma_noise=0.5,  # The old port called this noise_variance=0.25.
+        prior_precision=1.0,
+        seed=11,
+        backend=BackPackGGN,
+    )
+    assert estimator.fit(loader, iterations=1, lr=1e-12) is None
+    mean, covariance = estimator.predictive_moments(inputs[:2])
+    torch.testing.assert_close(mean, torch.tensor([[0.3], [0.7]]))
+    torch.testing.assert_close(
+        covariance, torch.tensor([[[0.4]], [[0.6]]]), rtol=1e-4, atol=1e-5
+    )
+    assert estimator.fit_history_["objective"] == pytest.approx([3.631515], rel=1e-4)
+
+
+def test_factory_and_unsupported_combinations(data):
+    from laplace.utils import FunctionalApproximation
+
+    assert FunctionalApproximation.NYSTROM.value == "nystrom"
+    x, loader, model = data
+    assert isinstance(make_ella(model), ELLA)
+    assert isinstance(make_valla(model, inducing_locations=x[:2]), VaLLA)
+    assert isinstance(
+        Laplace(model, "classification", "all", "gp", n_subset=2),
+        FunctionalLaplace,
+    )
+    with pytest.raises(ValueError, match="requires hessian_structure"):
+        Laplace(
+            model, "classification", "all", "diag", functional_approximation="nystrom"
+        )
+    with pytest.raises(ValueError, match="subset_of_weights='all'"):
+        Laplace(
+            model,
+            "classification",
+            "last_layer",
+            "gp",
+            functional_approximation="variational",
+        )
+    with pytest.raises(ValueError, match="functional_approximation"):
+        Laplace(model, "classification", "all", "gp", functional_approximation="other")
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_functional_prior_mean_remains_zero(method, data):
+    x, _, model = data
+    estimator = (
+        make_ella(model)
+        if method == "nystrom"
+        else make_valla(model, inducing_locations=x[:2].clone())
+    )
+    with pytest.raises(ValueError, match="prior_mean=0"):
+        estimator.prior_mean = 1.0
+    torch.testing.assert_close(
+        estimator.prior_mean, torch.zeros_like(estimator.prior_mean)
+    )
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_classification_noise_remains_one(method, data):
+    x, _, model = data
+    estimator = (
+        make_ella(model)
+        if method == "nystrom"
+        else make_valla(model, inducing_locations=x[:2].clone())
+    )
+    with pytest.raises(ValueError, match="only available for regression"):
+        estimator.sigma_noise = 2.0
+    torch.testing.assert_close(
+        estimator.sigma_noise, torch.ones_like(estimator.sigma_noise)
+    )
+
+
+def test_ella_temperature_update_refreshes_posterior(data):
+    x, _, _ = data
+    targets = x.sum(dim=-1, keepdim=True)
+    loader = DataLoader(TensorDataset(x, targets), batch_size=2)
+    estimator = make_ella(torch.nn.Linear(2, 1), "regression")
+    estimator.fit(loader)
+    before = estimator.predictive_moments(x[:1])[1]
+    estimator.temperature = 2.0
+    after = estimator.predictive_moments(x[:1])[1]
+    assert torch.all(after > before)
+    with pytest.raises(ValueError, match="temperature must be positive"):
+        estimator.temperature = 0.0
+
+
+def test_valla_alpha_requires_mc_for_classification(data):
+    x, _, model = data
+    with pytest.raises(ValueError, match="requires mc_softmax_samples"):
+        make_valla(model, inducing_locations=x[:2].clone(), alpha=0.5)
+
+
+def test_valla_fit_validates_mutated_options(data):
+    x, loader, model = data
+    estimator = make_valla(model, inducing_locations=x[:2].clone())
+    estimator.alpha = 2.0
+    with pytest.raises(ValueError, match="alpha must be"):
+        estimator.fit(loader, iterations=1)
+    estimator.alpha = 1.0
+    estimator.mc_softmax_samples = -1
+    with pytest.raises(ValueError, match="mc_softmax_samples"):
+        estimator.fit(loader, iterations=1)
+    estimator.mc_softmax_samples = 0
+    estimator.temperature = -1.0
+    with pytest.raises(ValueError, match="temperature must be positive"):
+        estimator.fit(loader, iterations=1)
+    estimator.temperature = 1.0
+    estimator.fit(loader, iterations=1)
+    estimator.inducing_classes = torch.tensor([0])
+    with pytest.raises(ValueError, match="inducing_classes"):
+        estimator.fit(loader, iterations=1, override=False)
+
+
+@pytest.mark.parametrize("strategy", ["fixed", "random"])
+def test_valla_refit_override_and_warm_start(data, strategy):
+    x, loader, model = data
+    estimator = make_valla(
+        model,
+        inducing_locations=x[:2].clone() if strategy == "fixed" else "random",
+        **({} if strategy == "fixed" else {"num_inducing": 2}),
+    )
+    estimator.fit(loader, iterations=1, lr=0.1)
+    first_locations = estimator.inducing_locations.detach().clone()
+    estimator.fit(loader, iterations=1, lr=0.1, override=False)
+    assert len(estimator.fit_history_["objective"]) == 2
+    estimator.fit(loader, iterations=1, lr=1e-10, override=True)
+    assert len(estimator.fit_history_["objective"]) == 1
+    torch.testing.assert_close(
+        estimator.L.detach(),
+        torch.tensor([1.0, 0.0, 1.0]),
+        atol=1e-6,
+        rtol=0,
+    )
+    assert not torch.allclose(estimator.inducing_locations.detach(), first_locations)
+
+
+def test_valla_checkpoint_preserves_refit_initialization(data):
+    x, loader, model = data
+    pristine_model = deepcopy(model)
+    estimator = make_valla(model, inducing_locations=x[:2].clone())
+    estimator.fit(loader, iterations=1, lr=0.1)
+    restored = make_valla(pristine_model, inducing_locations=torch.zeros_like(x[:2]))
+    restored.load_state_dict(state_dict=estimator.state_dict())
+    restored.fit(loader, iterations=1, lr=1e-10, override=True)
+    torch.testing.assert_close(
+        restored.inducing_locations.detach(), x[:2], atol=1e-6, rtol=0
+    )
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+@pytest.mark.parametrize("target_format", ["column", "onehot"])
+def test_classification_target_shapes_agree(data, method, target_format):
+    x, _, model = data
+    flat = torch.tensor([0, 1, 1, 0])
+    alternative = (
+        flat[:, None]
+        if target_format == "column"
+        else torch.nn.functional.one_hot(flat, num_classes=2)
+    )
+    histories = []
+    for targets in (flat, alternative):
+        loader = DataLoader(TensorDataset(x, targets), batch_size=2)
+        estimator = (
+            make_ella(deepcopy(model))
+            if method == "nystrom"
+            else make_valla(deepcopy(model), inducing_locations=x[:2].clone())
+        )
+        if method == "nystrom":
+            estimator.fit(loader, val_loader=loader)
+            histories.append((estimator.fit_history_["val_nll"],))
+        else:
+            estimator.fit(loader, iterations=1, val_loader=loader)
+            histories.append(
+                (estimator.fit_history_["objective"], estimator.fit_history_["val_nll"])
+            )
+    for first, second in zip(histories[0], histories[1]):
+        torch.testing.assert_close(torch.tensor(first), torch.tensor(second))
+
+
+def test_valla_functional_covariance_requires_fit_and_raw_jacobians(data):
+    x, loader, model = data
+    estimator = make_valla(model, inducing_locations=x[:2].clone())
+    jacobians = torch.zeros(2, 2, estimator.n_params)
+    with pytest.raises(RuntimeError, match="fit"):
+        estimator.functional_variance(jacobians)
+    with pytest.raises(RuntimeError, match="fit"):
+        estimator.functional_covariance(jacobians)
+    estimator.fit(loader, iterations=1)
+    with pytest.raises(ValueError, match="Invalid Jacobians shape"):
+        estimator.functional_variance(jacobians[..., :-1])
+
+
+def test_predictive_alias_preserves_argument_order_for_weight_space(data):
+    x, loader, model = data
+    estimator = Laplace(model, "classification", "all", "diag")
+    estimator.fit(loader)
+    torch.testing.assert_close(
+        estimator.predictive(x[:2], "glm", "probit", 10),
+        estimator(x[:2], pred_type="glm", link_approx="probit", n_samples=10),
+    )
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_classification_fit_predict_samples_and_model_preservation(data, method):
+    x, loader, model = data
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    estimator = (
+        make_ella(model)
+        if method == "nystrom"
+        else make_valla(model, inducing_locations=x[:2].clone())
+    )
+    with pytest.raises(RuntimeError, match="fit"):
+        estimator.predictive_moments(x[:2])
+    with pytest.raises(RuntimeError, match="fit"):
+        estimator.state_dict()
+    result = (
+        estimator.fit(loader)
+        if method == "nystrom"
+        else estimator.fit(loader, iterations=2, lr=1e-3)
+    )
+    assert result is None
+    assert estimator.fit_history_
+    mean, covariance = estimator.predictive_moments(x[:2])
+    probability = estimator(x[:2])
+    torch.testing.assert_close(
+        estimator.predictive(x[:2], "gp", "probit", 10), probability
+    )
+    assert mean.shape == (2, 2)
+    assert covariance.shape == (2, 2, 2)
+    assert probability.shape == (2, 2)
+    torch.testing.assert_close(probability.sum(-1), torch.ones(2))
+    assert estimator.functional_samples(x[:2], n_samples=3).shape == (3, 2, 2)
+    assert estimator.predictive_samples(x[:2], n_samples=3).shape == (3, 2, 2)
+    if method == "nystrom":
+        jacobians, _ = estimator.backend.jacobians(x[:2])
+        torch.testing.assert_close(estimator.functional_variance(jacobians), covariance)
+        torch.testing.assert_close(
+            estimator.functional_covariance(jacobians),
+            estimator.predictive_moments(x[:2], joint=True)[1],
+        )
+    with pytest.raises(ValueError, match="positive"):
+        estimator.functional_samples(x[:2], n_samples=0)
+    with pytest.raises(NotImplementedError):
+        estimator.log_marginal_likelihood()
+    with pytest.raises(NotImplementedError):
+        _ = estimator.log_likelihood
+    for key, value in before.items():
+        torch.testing.assert_close(model.state_dict()[key], value)
+    assert list(model.named_parameters())
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_regression_joint_sampling_and_serialization(data, method):
+    x, _, model = data
+    regression_model = torch.nn.Sequential(torch.nn.Linear(2, 1))
+    restored_model = deepcopy(regression_model)
+    loader = DataLoader(TensorDataset(x, x.sum(-1, keepdim=True)), batch_size=2)
+    options = {"sigma_noise": 0.5, "temperature": 2.0}
+    estimator = (
+        make_ella(regression_model, "regression", **options)
+        if method == "nystrom"
+        else make_valla(
+            regression_model, "regression", inducing_locations=x[:2].clone(), **options
+        )
+    )
+    if method == "nystrom":
+        estimator.fit(loader)
+    else:
+        estimator.fit(loader, iterations=2, lr=1e-3)
+    mean, covariance = estimator(x[:2])
+    joint_mean, joint_covariance = estimator(x[:2], joint=True)
+    assert mean.shape == (2, 1)
+    assert covariance.shape == (2, 1, 1)
+    assert joint_mean.shape == (2,)
+    assert joint_covariance.shape == (2, 2)
+    torch.testing.assert_close(joint_covariance.diag(), covariance[:, 0, 0])
+    assert estimator.functional_samples(x[:2], n_samples=3).shape == (3, 2, 1)
+    load_options = {"sigma_noise": 0.5}
+    restored = (
+        make_ella(restored_model, "regression", **load_options)
+        if method == "nystrom"
+        else make_valla(
+            restored_model,
+            "regression",
+            inducing_locations=x[:2].clone(),
+            **load_options,
+        )
+    )
+    restored.load_state_dict(state_dict=estimator.state_dict())
+    assert restored.temperature == 2.0
+    loaded_mean, loaded_covariance = restored(x[:2])
+    torch.testing.assert_close(loaded_mean, mean)
+    torch.testing.assert_close(loaded_covariance, covariance)
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_checkpoint_restores_evaluation_mode(data, method):
+    x, loader, _ = data
+    model = torch.nn.Sequential(
+        torch.nn.Linear(2, 3), torch.nn.Dropout(0.5), torch.nn.Linear(3, 2)
+    )
+    restored_model = deepcopy(model)
+    estimator = (
+        make_ella(model)
+        if method == "nystrom"
+        else make_valla(model, inducing_locations=x[:2].clone())
+    )
+    estimator.fit(loader) if method == "nystrom" else estimator.fit(
+        loader, iterations=2
+    )
+    restored = (
+        make_ella(restored_model)
+        if method == "nystrom"
+        else make_valla(restored_model, inducing_locations=x[:2].clone())
+    )
+    assert restored_model.training
+    restored.load_state_dict(estimator.state_dict())
+    assert not restored_model.training
+    torch.testing.assert_close(
+        restored.predictive_moments(x[:2])[0], estimator.predictive_moments(x[:2])[0]
+    )
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+@pytest.mark.parametrize("backend", [CurvlinopsGGN, AsdlGGN, BackPackGGN])
+def test_fit_preserves_pretrained_gradient_buffers(data, method, backend):
+    x, loader, model = data
+    before = []
+    for index, parameter in enumerate(model.parameters()):
+        parameter.grad = None if index == 0 else torch.full_like(parameter, 0.123)
+        before.append(None if parameter.grad is None else parameter.grad.clone())
+    estimator = (
+        make_ella(model, backend=backend)
+        if method == "nystrom"
+        else make_valla(model, inducing_locations=x[:2].clone(), backend=backend)
+    )
+    estimator.fit(loader) if method == "nystrom" else estimator.fit(
+        loader, iterations=1
+    )
+    for parameter, old_gradient in zip(model.parameters(), before):
+        if old_gradient is None:
+            assert parameter.grad is None
+        else:
+            torch.testing.assert_close(parameter.grad, old_gradient)
+
+
+def test_ella_noise_and_validation_grid(data):
+    x, _, model = data
+    loader = DataLoader(TensorDataset(x, x.sum(-1, keepdim=True)), batch_size=2)
+    estimator = make_ella(
+        model=torch.nn.Sequential(torch.nn.Linear(2, 1)), likelihood="regression"
+    )
+    estimator.fit(loader, val_loader=loader)
+    low = estimator.predictive_moments(x)[1]
+    estimator.sigma_noise = 2.0
+    high = estimator.predictive_moments(x)[1]
+    assert torch.all(
+        high.diagonal(dim1=-2, dim2=-1) >= low.diagonal(dim1=-2, dim2=-1) - 1e-6
+    )
+    estimator.optimize_prior_precision(
+        "gp", method="gridsearch", val_loader=loader, grid_size=3
+    )
+    assert len(estimator.fit_history_["tuning"]) == 3
+    assert torch.isfinite(estimator.prior_precision).all()
+    with pytest.raises(NotImplementedError):
+        estimator.optimize_prior_precision(method="marglik", val_loader=loader)
+
+
+@pytest.mark.parametrize("alpha", [0.0, 0.5, 1.0])
+def test_valla_regression_alpha_energy(data, alpha):
+    x, _, _ = data
+    model = torch.nn.Linear(2, 1)
+    loader = DataLoader(TensorDataset(x, x.sum(-1, keepdim=True)), batch_size=2)
+    estimator = make_valla(
+        model,
+        "regression",
+        inducing_locations=x[:2].clone(),
+        alpha=alpha,
+        sigma_noise=0.5,
+    )
+    estimator.fit(loader, iterations=1)
+    inputs, targets = next(iter(loader))
+    mean, covariance, kernel, hessian, correction = estimator._latent_distribution(
+        inputs
+    )
+    noise_variance = estimator.sigma_noise.square()
+    latent_variance = covariance.diagonal(dim1=-2, dim2=-1)
+    if alpha == 0:
+        energy = ((targets - mean).square() + latent_variance) / noise_variance
+    else:
+        energy = (targets - mean).square() / (
+            noise_variance + alpha * latent_variance
+        ) + torch.log1p(alpha * latent_variance / noise_variance) / alpha
+    log_term = -0.5 * (energy + torch.log(2 * torch.pi * noise_variance)).sum()
+    kl = 0.5 * (
+        torch.linalg.slogdet(hessian).logabsdet - torch.trace(kernel @ correction)
+    )
+    expected = -(estimator.n_data / len(inputs)) * log_term / estimator.temperature + kl
+    torch.testing.assert_close(estimator._objective(inputs, targets), expected)
+    assert estimator.state_dict()["alpha"] == alpha
+
+
+@pytest.mark.parametrize("alpha", [0.0, 0.5, 1.0])
+def test_valla_classification_mc_energy(data, alpha):
+    x, loader, model = data
+    estimator = make_valla(
+        model,
+        inducing_locations=x[:2].clone(),
+        alpha=alpha,
+        mc_softmax_samples=4,
+    )
+    estimator.fit(loader, iterations=1)
+    assert torch.isfinite(torch.tensor(estimator.fit_history_["objective"])).all()
+    assert estimator.state_dict()["mc_softmax_samples"] == 4
+
+
+def test_valla_random_inducing_and_prior_fit(data):
+    x, _, _ = data
+    loader = DataLoader(TensorDataset(x, x.sum(-1, keepdim=True)), batch_size=2)
+    estimator = make_valla(
+        torch.nn.Sequential(torch.nn.Linear(2, 1)),
+        "regression",
+        inducing_locations="random",
+        num_inducing=2,
+        sigma_noise=0.5,
+    )
+    estimator.fit(loader, iterations=2, lr=1e-3)
+    assert isinstance(estimator.inducing_locations, torch.nn.Parameter)
+    assert len(estimator.fit_history_["objective"]) == 2
+    with pytest.raises(NotImplementedError):
+        estimator.optimize_prior_precision()
+
+
+class RewardModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = torch.nn.Linear(2, 1)
+
+    def forward(self, x):
+        if isinstance(x, dict):
+            x = x["input_ids"]
+        output = self.net(x)
+        return output.squeeze(-1) if x.ndim == 3 else output
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+@pytest.mark.parametrize("mapping", [False, True])
+def test_reward_modeling_pair_fit_single_prediction(method, mapping):
+    torch.manual_seed(10)
+    pairs = torch.randn(6, 2, 2)
+    labels = torch.randint(0, 2, (6,))
+    dataset = (
+        [{"input_ids": pair, "labels": label} for pair, label in zip(pairs, labels)]
+        if mapping
+        else TensorDataset(pairs, labels)
+    )
+    loader = DataLoader(dataset, batch_size=2)
+    estimator = (
+        make_ella(RewardModel(), "reward_modeling")
+        if method == "nystrom"
+        else make_valla(
+            RewardModel(),
+            "reward_modeling",
+            inducing_locations="random",
+            num_inducing=2,
+        )
+    )
+    if method == "nystrom":
+        estimator.fit(loader)
+    else:
+        estimator.fit(loader, iterations=1, lr=1e-3)
+    pair_input = {"input_ids": pairs[:2]} if mapping else pairs[:2]
+    single_input = {"input_ids": pairs[:2, 0]} if mapping else pairs[:2, 0]
+    assert estimator(pair_input, fitting=True).shape == (2, 2)
+    mean, covariance = estimator(single_input)
+    assert mean.shape == (2, 1)
+    assert covariance.shape == (2, 1, 1)
+    assert estimator.predictive_samples(single_input, n_samples=2).shape == (2, 2, 1)
+
+
+@pytest.mark.parametrize("backend", [CurvlinopsGGN, AsdlGGN, BackPackGGN])
+def test_valla_selected_output_backends(data, backend):
+    x, loader, model = data
+    estimator = make_valla(model, inducing_locations=x[:2].clone(), backend=backend)
+    estimator.fit(loader, iterations=1, lr=1e-3)
+    assert torch.isfinite(estimator.predictive_moments(x[:2])[1]).all()
+
+
+@pytest.mark.parametrize("backend", [CurvlinopsGGN, AsdlGGN, BackPackGGN])
+def test_ella_curvature_backends(data, backend):
+    x, loader, model = data
+    estimator = make_ella(model, backend=backend)
+    estimator.fit(loader)
+    assert torch.isfinite(estimator.predictive_moments(x[:2])[1]).all()
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_checkpoint_requires_same_pretrained_model(data, method):
+    x, loader, model = data
+    estimator = (
+        make_ella(model)
+        if method == "nystrom"
+        else make_valla(model, inducing_locations=x[:2].clone())
+    )
+    if method == "nystrom":
+        estimator.fit(loader)
+    else:
+        estimator.fit(loader, iterations=1, lr=1e-3)
+    changed_model = deepcopy(model)
+    with torch.no_grad():
+        next(changed_model.parameters()).add_(1.0)
+    restored = (
+        make_ella(changed_model)
+        if method == "nystrom"
+        else make_valla(changed_model, inducing_locations=x[:2].clone())
+    )
+    with pytest.raises(ValueError, match="same pretrained model"):
+        restored.load_state_dict(estimator.state_dict())
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_checkpoint_rejects_different_trainable_coordinates(data, method):
+    x, loader, _ = data
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2))
+    other_model = deepcopy(model)
+    for parameter in model[0].parameters():
+        parameter.requires_grad_(False)
+    for parameter in other_model[1].parameters():
+        parameter.requires_grad_(False)
+    estimator = (
+        make_ella(model)
+        if method == "nystrom"
+        else make_valla(model, inducing_locations=x[:2].clone())
+    )
+    estimator.fit(loader) if method == "nystrom" else estimator.fit(
+        loader, iterations=1
+    )
+    restored = (
+        make_ella(other_model)
+        if method == "nystrom"
+        else make_valla(other_model, inducing_locations=x[:2].clone())
+    )
+    with pytest.raises(ValueError, match="trainable coordinates"):
+        restored.load_state_dict(estimator.state_dict())
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_checkpoint_rejects_different_parameterless_module(data, method):
+    x, loader, _ = data
+    model = torch.nn.Sequential(
+        torch.nn.Linear(2, 3), torch.nn.ReLU(), torch.nn.Linear(3, 2)
+    )
+    other_model = deepcopy(model)
+    other_model[1] = torch.nn.Tanh()
+    estimator = (
+        make_ella(model)
+        if method == "nystrom"
+        else make_valla(model, inducing_locations=x[:2].clone())
+    )
+    estimator.fit(loader) if method == "nystrom" else estimator.fit(
+        loader, iterations=1
+    )
+    restored = (
+        make_ella(other_model)
+        if method == "nystrom"
+        else make_valla(other_model, inducing_locations=x[:2].clone())
+    )
+    with pytest.raises(ValueError, match="same pretrained model"):
+        restored.load_state_dict(estimator.state_dict())
+
+
+def test_ella_backpack_checkpoint_into_fresh_model(data):
+    x, loader, model = data
+    fresh_model = deepcopy(model)
+    estimator = make_ella(model, backend=BackPackGGN)
+    estimator.fit(loader)
+    restored = make_ella(fresh_model, backend=BackPackGGN)
+    restored.load_state_dict(estimator.state_dict())
+    observed = restored.predictive_moments(x[:2])
+    expected = estimator.predictive_moments(x[:2])
+    torch.testing.assert_close(observed[0], expected[0])
+    torch.testing.assert_close(observed[1], expected[1])
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_mapping_backend_limit(method):
+    pairs = torch.randn(4, 2, 2)
+    dataset = [
+        {"input_ids": pair, "labels": torch.tensor(index % 2)}
+        for index, pair in enumerate(pairs)
+    ]
+    loader = DataLoader(dataset, batch_size=2)
+    estimator = (
+        make_ella(RewardModel(), "reward_modeling", backend=BackPackGGN)
+        if method == "nystrom"
+        else make_valla(
+            RewardModel(),
+            "reward_modeling",
+            backend=BackPackGGN,
+            inducing_locations={"input_ids": pairs[:, 0][:2].clone()},
+        )
+    )
+    with pytest.raises(ValueError, match="mapping-style"):
+        if method == "nystrom":
+            estimator.fit(loader)
+        else:
+            estimator.fit(loader, iterations=1, lr=1e-3)
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_mapping_reward_asdl_backend(method):
+    pairs = torch.randn(4, 2, 2)
+    dataset = [
+        {"input_ids": pair, "labels": torch.tensor(index % 2)}
+        for index, pair in enumerate(pairs)
+    ]
+    loader = DataLoader(dataset, batch_size=2)
+    estimator = (
+        make_ella(RewardModel(), "reward_modeling", backend=AsdlGGN)
+        if method == "nystrom"
+        else make_valla(
+            RewardModel(),
+            "reward_modeling",
+            backend=AsdlGGN,
+            inducing_locations={"input_ids": pairs[:, 0][:2].clone()},
+        )
+    )
+    if method == "nystrom":
+        estimator.fit(loader)
+    else:
+        estimator.fit(loader, iterations=1, lr=1e-3)
+    mean, covariance = estimator.predictive_moments({"input_ids": pairs[:2, 0]})
+    assert mean.shape == (2, 1)
+    assert covariance.shape == (2, 1, 1)
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_tensor_reward_backpack_backend(method):
+    pairs = torch.randn(4, 2, 2)
+    labels = torch.tensor([0, 1, 0, 1])
+    loader = DataLoader(TensorDataset(pairs, labels), batch_size=2)
+    estimator = (
+        make_ella(RewardModel(), "reward_modeling", backend=BackPackGGN)
+        if method == "nystrom"
+        else make_valla(
+            RewardModel(),
+            "reward_modeling",
+            backend=BackPackGGN,
+            inducing_locations=pairs[:, 0][:2].clone(),
+        )
+    )
+    if method == "nystrom":
+        estimator.fit(loader)
+    else:
+        estimator.fit(loader, iterations=1, lr=1e-3)
+    mean, covariance = estimator.predictive_moments(pairs[:2, 0])
+    assert mean.shape == (2, 1)
+    assert covariance.shape == (2, 1, 1)
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_backpack_prediction_under_no_grad(data, method):
+    x, loader, model = data
+    estimator = (
+        make_ella(model, backend=BackPackGGN)
+        if method == "nystrom"
+        else make_valla(model, inducing_locations=x[:2].clone(), backend=BackPackGGN)
+    )
+    if method == "nystrom":
+        estimator.fit(loader)
+    else:
+        estimator.fit(loader, iterations=1, lr=1e-3, val_loader=loader, val_steps=1)
+    with torch.no_grad():
+        mean, covariance = estimator.predictive_moments(x[:2])
+    assert mean.shape == (2, 2)
+    assert covariance.shape == (2, 2, 2)
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_single_output_regression_vector_targets(method):
+    torch.manual_seed(12)
+    x = torch.tensor([[0.0, 1.0], [1.0, 0.0], [1.0, 1.0], [2.0, 1.0]])
+    y = x.sum(-1)
+    vector_loader = DataLoader(TensorDataset(x, y), batch_size=2)
+    matrix_loader = DataLoader(TensorDataset(x, y[:, None]), batch_size=2)
+    original = torch.nn.Linear(2, 1)
+    model_copy = deepcopy(original)
+    options = (
+        {"subsample_size": 2, "n_eigenvalues": 1}
+        if method == "nystrom"
+        else {"inducing_locations": x[:2].clone()}
+    )
+    vector = Laplace(
+        original,
+        "regression",
+        "all",
+        "gp",
+        functional_approximation=method,
+        **options,
+    )
+    matrix = Laplace(
+        model_copy,
+        "regression",
+        "all",
+        "gp",
+        functional_approximation=method,
+        **options,
+    )
+    if method == "nystrom":
+        vector.fit(vector_loader, val_loader=vector_loader)
+        matrix.fit(matrix_loader, val_loader=matrix_loader)
+    else:
+        vector.fit(vector_loader, iterations=1, lr=1e-3, val_loader=vector_loader)
+        matrix.fit(matrix_loader, iterations=1, lr=1e-3, val_loader=matrix_loader)
+        torch.testing.assert_close(
+            torch.tensor(vector.fit_history_["objective"]),
+            torch.tensor(matrix.fit_history_["objective"]),
+        )
+    torch.testing.assert_close(
+        torch.tensor(vector.fit_history_["val_nll"]),
+        torch.tensor(matrix.fit_history_["val_nll"]),
+    )
+
+
+def test_valla_mapping_state_is_a_snapshot():
+    inputs = {"input_ids": torch.randn(2, 2)}
+    pairs = torch.randn(4, 2, 2)
+    loader = DataLoader(
+        [
+            {"input_ids": pair, "labels": torch.tensor(index % 2)}
+            for index, pair in enumerate(pairs)
+        ],
+        batch_size=2,
+    )
+    estimator = make_valla(RewardModel(), "reward_modeling", inducing_locations=inputs)
+    estimator.fit(loader, iterations=1, lr=1e-3)
+    estimator.fit_history_["objective"] = [1.0]
+    state = estimator.state_dict()
+    estimator.inducing_locations["input_ids"].add_(10)
+    estimator.fit_history_["objective"].append(2.0)
+    assert not torch.equal(
+        state["inducing_locations"]["input_ids"],
+        estimator.inducing_locations["input_ids"],
+    )
+    assert state["fit_history"]["objective"] == [1.0]
+
+
+def test_valla_fixed_mapping_accepts_nonleaf_inputs():
+    inputs = torch.randn(2, 2, requires_grad=True) * 2
+    estimator = make_valla(
+        RewardModel(),
+        "reward_modeling",
+        inducing_locations={"input_ids": inputs},
+    )
+    selected = estimator.inducing_locations["input_ids"]
+    torch.testing.assert_close(selected, inputs)
+    assert selected.grad_fn is None
+    assert not selected.requires_grad
+    assert selected.data_ptr() != inputs.data_ptr()
+
+
+def test_valla_fixed_integer_inducing_is_a_snapshot():
+    inputs = torch.tensor([[1, 2], [3, 4]], dtype=torch.long)
+    estimator = make_valla(torch.nn.Linear(2, 2), inducing_locations=inputs)
+    selected = estimator.inducing_locations
+    torch.testing.assert_close(selected, inputs)
+    assert selected.data_ptr() != inputs.data_ptr()
+    inputs.add_(10)
+    torch.testing.assert_close(selected, torch.tensor([[1, 2], [3, 4]]))
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_inducing_and_basis_respect_training_sampler(method):
+    x = torch.tensor(
+        [[1.0, 0.0], [0.0, 1.0], [2.0, 0.0], [0.0, 2.0], [3.0, 0.0], [0.0, 3.0]]
+    )
+    y = x.sum(-1, keepdim=True)
+    loader = DataLoader(
+        TensorDataset(x, y),
+        batch_size=1,
+        sampler=SubsetRandomSampler([0, 1]),
+    )
+    if method == "nystrom":
+        estimator = make_ella(torch.nn.Linear(2, 1), "regression")
+        assert set(estimator._indices(loader, balanced=False).tolist()) == {0, 1}
+        estimator.fit(loader)
+    else:
+        estimator = make_valla(
+            torch.nn.Linear(2, 1),
+            "regression",
+            inducing_locations="random",
+            num_inducing=2,
+        )
+        estimator.fit(loader, iterations=1, lr=1e-3)
+        selected = estimator.inducing_locations.detach()
+        assert all(
+            any(torch.allclose(row, expected, atol=0.01) for expected in x[:2])
+            for row in selected
+        )
+    assert estimator.n_data == 2
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_custom_batch_sampler_keeps_subset_batches(method):
+    inputs = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+    targets = torch.tensor([0, 1, 1, 0])
+    dataset = TensorDataset(inputs, targets)
+    loader = DataLoader(
+        dataset,
+        batch_sampler=BatchSampler(
+            SequentialSampler(dataset), batch_size=2, drop_last=False
+        ),
+    )
+    estimator = (
+        make_ella(torch.nn.Linear(2, 2))
+        if method == "nystrom"
+        else make_valla(
+            torch.nn.Linear(2, 2), inducing_locations="random", num_inducing=2
+        )
+    )
+    estimator.fit(loader) if method == "nystrom" else estimator.fit(
+        loader, iterations=1
+    )
+    assert estimator.predictive_moments(inputs[:2])[0].shape == (2, 2)
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+@pytest.mark.parametrize("custom_batch_sampler", [False, True])
+def test_deterministic_drop_last_excludes_unseen_rows(method, custom_batch_sampler):
+    inputs = torch.tensor(
+        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [99.0, 99.0]]
+    )
+    dataset = TensorDataset(inputs, inputs.sum(dim=-1, keepdim=True))
+    loader = (
+        DataLoader(
+            dataset,
+            batch_sampler=BatchSampler(SequentialSampler(dataset), 2, True),
+        )
+        if custom_batch_sampler
+        else DataLoader(dataset, batch_size=2, drop_last=True)
+    )
+    estimator = (
+        make_ella(torch.nn.Linear(2, 1), "regression")
+        if method == "nystrom"
+        else make_valla(
+            torch.nn.Linear(2, 1),
+            "regression",
+            inducing_locations="random",
+            num_inducing=2,
+        )
+    )
+    estimator.fit(loader) if method == "nystrom" else estimator.fit(
+        loader, iterations=1
+    )
+    assert estimator.n_data == 4
+    if method == "nystrom":
+        assert torch.all(estimator._indices(loader, balanced=False) < 4)
+    else:
+        assert all(
+            any(torch.allclose(row, candidate, atol=0.05) for candidate in inputs[:4])
+            for row in estimator.inducing_locations.detach()
+        )
+
+
+def test_ella_mc_link_handles_singular_covariance_and_generator(data):
+    x, loader, model = data
+    estimator = make_ella(model)
+    estimator.fit(loader)
+    first = estimator(
+        x[:2],
+        link_approx="mc",
+        n_samples=32,
+        generator=torch.Generator().manual_seed(4),
+    )
+    second = estimator(
+        x[:2],
+        link_approx="mc",
+        n_samples=32,
+        generator=torch.Generator().manual_seed(4),
+    )
+    torch.testing.assert_close(first, second)
+    torch.testing.assert_close(first.sum(-1), torch.ones(2))
+
+
+def test_joint_functional_samples_follow_joint_covariance():
+    torch.manual_seed(4)
+    train_x = torch.tensor([[1.0, 0.0], [1.0, 1.0]])
+    loader = DataLoader(TensorDataset(train_x, torch.zeros(2, 1)), batch_size=1)
+    estimator = Laplace(
+        torch.nn.Linear(2, 1, bias=False),
+        "regression",
+        "all",
+        "gp",
+        functional_approximation="nystrom",
+        subsample_size=2,
+        n_eigenvalues=2,
+    )
+    estimator.fit(loader)
+    query = torch.eye(2)
+    _, covariance = estimator.predictive_moments(query, joint=True)
+    samples = estimator.functional_samples(
+        query, n_samples=4000, joint=True, generator=torch.Generator().manual_seed(5)
+    )[:, :, 0]
+    torch.testing.assert_close(torch.cov(samples.T), covariance, atol=0.04, rtol=0.1)
