@@ -59,6 +59,7 @@ the default uses the deterministic probit approximation for `alpha=1`.
 Classification and reward modeling with another alpha require Monte Carlo
 samples because the probit approximation does not depend on alpha.
 Repeated `fit` calls reset VaLLA's inducing and variational state by default;
+the learned prior precision and regression noise carry over.
 pass `override=False` to continue optimizing the fitted state and append to
 `fit_history_`.
 
@@ -76,7 +77,9 @@ The upstream `__call__` returns *latent* regression covariance without
 observation noise. BayesiPy's `predict` adapter adds noise and reverses target
 normalization. Neither ELLA nor VaLLA provides the subset-of-data GP marginal
 likelihood, a tracked training log likelihood, or weight-space samples. Both provide `state_dict` and
-`load_state_dict` for reuse with the same pretrained model.
+`load_state_dict` for reuse with the same pretrained model and matching input
+keys, curvature backend, backend options, and backpropagation setting. The
+checkpoint restores the sampling seed (and VaLLA's random-generator state).
 
 See the [ELLA](api_reference/ella.md) and
 [VaLLA](api_reference/valla.md) API references.

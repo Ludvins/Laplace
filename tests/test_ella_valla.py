@@ -995,3 +995,141 @@ def test_joint_functional_samples_follow_joint_covariance():
         query, n_samples=4000, joint=True, generator=torch.Generator().manual_seed(5)
     )[:, :, 0]
     torch.testing.assert_close(torch.cov(samples.T), covariance, atol=0.04, rtol=0.1)
+
+
+@pytest.mark.parametrize("scale", [10_000.0, 100_000.0])
+def test_valla_large_float32_features_keep_positive_variance(scale):
+    model = torch.nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.weight.zero_()
+    inducing = torch.tensor([[scale]])
+    loader = DataLoader(
+        TensorDataset(torch.zeros(2, 1), torch.zeros(2, 1)), batch_size=2
+    )
+    estimator = make_valla(model, "regression", inducing_locations=inducing)
+    estimator.fit(loader, iterations=1, lr=1e-12)
+    query = torch.tensor([[0.99 * scale], [0.98 * scale]])
+    _, covariance = estimator.predictive_moments(query)
+    expected = query.square() / (1 + inducing.square())
+    torch.testing.assert_close(
+        covariance[:, 0, 0], expected[:, 0], rtol=1e-4, atol=1e-4
+    )
+    joint = estimator.predictive_moments(query, joint=True)[1]
+    assert torch.linalg.eigvalsh(joint).min() >= -1e-6
+    assert torch.isfinite(estimator.functional_samples(query, n_samples=2)).all()
+
+
+def test_valla_rank_deficient_inducing_features_keep_finite_gradients():
+    model = torch.nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.weight.zero_()
+    inputs = torch.tensor([[1.0], [2.0]])
+    loader = DataLoader(TensorDataset(inputs, torch.zeros_like(inputs)), batch_size=2)
+    estimator = make_valla(model, "regression", inducing_locations=torch.zeros(2, 1))
+    estimator.fit(loader, iterations=1)
+    assert torch.isfinite(torch.tensor(estimator.fit_history_["objective"])).all()
+    assert torch.isfinite(estimator.L).all()
+    assert torch.isfinite(estimator.predictive_moments(inputs)[1]).all()
+
+
+def test_valla_large_duplicate_inducing_features_keep_precision_invertible():
+    scale = 100_000.0
+    model = torch.nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.weight.zero_()
+    inducing = torch.full((2, 1), scale)
+    loader = DataLoader(
+        TensorDataset(torch.zeros(2, 1), torch.zeros(2, 1)), batch_size=2
+    )
+    estimator = make_valla(model, "regression", inducing_locations=inducing)
+    estimator.fit(loader, iterations=1, lr=1e-12)
+    query = torch.tensor([[0.99 * scale]])
+    variance = estimator.predictive_moments(query)[1][0, 0, 0]
+    expected = query.square() / (1 + 2 * inducing[0].square())
+    torch.testing.assert_close(variance, expected.squeeze(), rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_reward_modeling_recognizes_backpack_subclasses(method):
+    class AlternateGGN(BackPackGGN):
+        pass
+
+    pairs = torch.randn(4, 2, 2)
+    labels = torch.tensor([0, 1, 0, 1])
+    loader = DataLoader(TensorDataset(pairs, labels), batch_size=2)
+    estimator = (
+        make_ella(RewardModel(), "reward_modeling", backend=AlternateGGN)
+        if method == "nystrom"
+        else make_valla(
+            RewardModel(),
+            "reward_modeling",
+            backend=AlternateGGN,
+            inducing_locations=pairs[:, 0][:2].clone(),
+        )
+    )
+    if method == "nystrom":
+        estimator.fit(loader)
+    else:
+        estimator.fit(loader, iterations=1)
+    assert torch.isfinite(estimator.predictive_moments(pairs[:2, 0])[1]).all()
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_checkpoint_rejects_different_mapping_key(method):
+    class MappingRegressor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(2, 1)
+
+        def forward(self, inputs):
+            return self.linear(inputs["features"])
+
+    inputs = torch.randn(4, 2)
+    loader = DataLoader(
+        [{"features": x, "labels": x.sum().unsqueeze(0)} for x in inputs],
+        batch_size=2,
+    )
+    model = MappingRegressor()
+    original = deepcopy(model)
+    options = {"dict_key_x": "features"}
+    estimator = (
+        make_ella(model, "regression", **options)
+        if method == "nystrom"
+        else make_valla(
+            model,
+            "regression",
+            inducing_locations={"features": inputs[:2].clone()},
+            **options,
+        )
+    )
+    if method == "nystrom":
+        estimator.fit(loader)
+        restored = make_ella(original, "regression")
+    else:
+        estimator.fit(loader, iterations=1)
+        restored = make_valla(
+            original,
+            "regression",
+            inducing_locations="random",
+            num_inducing=2,
+        )
+    with pytest.raises(ValueError, match="dict_key_x"):
+        restored.load_state_dict(estimator.state_dict())
+
+
+def test_valla_checkpoint_restores_random_inducing_seed(data):
+    x, loader, model = data
+    original = deepcopy(model)
+    estimator = make_valla(model, inducing_locations="random", num_inducing=2, seed=5)
+    estimator.fit(loader, iterations=1, lr=1e-10)
+    restored = make_valla(original, inducing_locations="random", num_inducing=2, seed=0)
+    restored.load_state_dict(estimator.state_dict())
+    assert restored.seed == 5
+    torch.testing.assert_close(
+        restored.generator.get_state(), estimator.generator.get_state()
+    )
+    estimator.fit(loader, iterations=1, lr=1e-10, override=True)
+    restored.fit(loader, iterations=1, lr=1e-10, override=True)
+    torch.testing.assert_close(
+        restored.inducing_locations, estimator.inducing_locations
+    )
