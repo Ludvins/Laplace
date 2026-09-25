@@ -459,6 +459,36 @@ def test_ella_noise_and_validation_grid(data):
         estimator.optimize_prior_precision(method="marglik", val_loader=loader)
 
 
+@pytest.mark.parametrize("backend", [CurvlinopsGGN, AsdlGGN, BackPackGGN])
+def test_ella_accepts_small_full_rank_subset_kernel(backend):
+    class ScaledLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(2, 1, bias=False)
+
+        def forward(self, inputs):
+            return 1e-4 * self.linear(inputs)
+
+    inputs = torch.eye(2)
+    loader = DataLoader(TensorDataset(inputs, torch.zeros(2, 1)), batch_size=2)
+    estimator = make_ella(
+        ScaledLinear(),
+        "regression",
+        subsample_size=2,
+        n_eigenvalues=1,
+        backend=backend,
+    )
+    estimator.fit(loader)
+    _, covariance = estimator.predictive_moments(inputs)
+    assert torch.isfinite(covariance).all()
+    torch.testing.assert_close(
+        covariance.diagonal(dim1=-2, dim2=-1).sum(),
+        torch.tensor(1e-8),
+        rtol=1e-4,
+        atol=1e-12,
+    )
+
+
 @pytest.mark.parametrize("alpha", [0.0, 0.5, 1.0])
 def test_valla_regression_alpha_energy(data, alpha):
     x, _, _ = data

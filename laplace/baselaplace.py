@@ -3565,16 +3565,19 @@ class ELLA(BaseFunctionalLaplace):
             selected_rows.append(
                 jacobians[torch.arange(len(choices), device=jacobians.device), choices]
             )
-        rows = torch.cat(selected_rows)
+        rows = torch.cat(selected_rows).to(torch.float64)
         kernel = rows @ rows.T
         eigenvalues, eigenvectors = torch.linalg.eigh(kernel)
         order = torch.argsort(eigenvalues, descending=True)[: self.n_eigenvalues]
         values = eigenvalues[order]
-        if torch.any(values <= torch.finfo(values.dtype).eps):
-            raise ValueError("Nyström subset kernel has insufficient positive rank.")
-        self.dual_directions = rows.T @ (
-            eigenvectors[:, order] / values.sqrt().unsqueeze(0)
+        tolerance = (
+            torch.finfo(values.dtype).eps * max(rows.shape) * eigenvalues.abs().max()
         )
+        if torch.any(values <= tolerance):
+            raise ValueError("Nyström subset kernel has insufficient positive rank.")
+        self.dual_directions = (
+            rows.T @ (eigenvectors[:, order] / values.sqrt().unsqueeze(0))
+        ).to(self._dtype)
 
     def _features(
         self, x: torch.Tensor | MutableMapping
