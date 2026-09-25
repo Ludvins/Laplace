@@ -154,9 +154,8 @@ def test_store_K_batch_block_diagonal_kernel(reg_loader, model, M=3, batch_size=
             assert torch.allclose(expected_K_MM[c], func_la.K_MM[c])
 
     func_la._init_K_MM()
-    # Right now K_MM is initialized with torch.empty. To run this tests we
-    #  must set it to zero.
-    func_la.K_MM = [0 * func_la.K_MM[i] for i in range(func_la.n_outputs)]
+    # K_MM uses uninitialized storage; multiplying it by zero can preserve NaNs.
+    func_la.K_MM = [torch.zeros_like(matrix) for matrix in func_la.K_MM]
 
     expected = [torch.zeros(size=(M, M)) for _ in range(C)]
     _check(expected)

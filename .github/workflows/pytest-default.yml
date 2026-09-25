@@ -22,3 +22,12 @@ jobs:
         run: |
           source .venv/bin/activate
           python3 -m pytest tests
+      - name: Smoke test function-space example
+        run: |
+          source .venv/bin/activate
+          python examples/functional_approximations.py
+      - name: Build documentation with strict checks
+        run: |
+          source .venv/bin/activate
+          uv pip install "mkdocs==1.6.1" "mkdocs-material==9.5.34" "mkdocstrings==0.26.1" "mkdocstrings-python==1.11.1" matplotlib
+          mkdocs build --strict

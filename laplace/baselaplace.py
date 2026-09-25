@@ -32,8 +32,8 @@ from laplace._functional_utils import (
     training_indices,
 )
 from laplace.curvature.asdfghjkl import AsdfghjklHessian
-from laplace.curvature.asdl import AsdlGGN
-from laplace.curvature.backpack import BackPackGGN
+from laplace.curvature.asdl import AsdlGGN, AsdlInterface
+from laplace.curvature.backpack import BackPackGGN, BackPackInterface
 from laplace.curvature.curvature import CurvatureInterface
 from laplace.curvature.curvlinops import CurvlinopsEF, CurvlinopsGGN
 from laplace.utils import SoDSampler
@@ -2165,6 +2165,50 @@ class DiagLaplace(ParametricLaplace):
 class BaseFunctionalLaplace(BaseLaplace):
     """Shared prediction interface for function-space posterior approximations."""
 
+    @staticmethod
+    def _same_configuration(left: Any, right: Any) -> bool:
+        if isinstance(left, torch.Tensor) or isinstance(right, torch.Tensor):
+            return (
+                isinstance(left, torch.Tensor)
+                and isinstance(right, torch.Tensor)
+                and torch.equal(left, right)
+            )
+        if isinstance(left, MutableMapping) and isinstance(right, MutableMapping):
+            return left.keys() == right.keys() and all(
+                BaseFunctionalLaplace._same_configuration(left[key], right[key])
+                for key in left
+            )
+        if isinstance(left, (tuple, list)) and isinstance(right, type(left)):
+            return len(left) == len(right) and all(
+                BaseFunctionalLaplace._same_configuration(a, b)
+                for a, b in zip(left, right)
+            )
+        return left == right
+
+    def _checkpoint_configuration(self) -> dict[str, Any]:
+        return {
+            "dict_key_x": self.dict_key_x,
+            "dict_key_y": self.dict_key_y,
+            "backend_class": (
+                f"{self._backend_cls.__module__}.{self._backend_cls.__qualname__}"
+            ),
+            "backend_kwargs": deepcopy(self._backend_kwargs),
+            "enable_backprop": self.enable_backprop,
+        }
+
+    def _validate_checkpoint_configuration(self, state_dict: dict[str, Any]) -> None:
+        for key, current in self._checkpoint_configuration().items():
+            if not self._same_configuration(state_dict.get(key), current):
+                raise ValueError(f"Checkpoint requires matching {key}.")
+
+    @property
+    def _uses_backpack_backend(self) -> bool:
+        return issubclass(self._backend_cls, BackPackInterface)
+
+    @property
+    def _uses_asdl_backend(self) -> bool:
+        return issubclass(self._backend_cls, AsdlInterface)
+
     def _glm_predictive_distribution(
         self, x: torch.Tensor | MutableMapping, joint: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -3503,7 +3547,7 @@ class ELLA(BaseFunctionalLaplace):
             x, _ = self._batch(batch)
             if (
                 self.likelihood == Likelihood.REWARD_MODELING
-                and "backpack" not in self._backend_cls.__name__.lower()
+                and not self._uses_backpack_backend
             ):
                 jacobians, outputs = CurvatureInterface.jacobians(self.backend, x)
             else:
@@ -3531,7 +3575,7 @@ class ELLA(BaseFunctionalLaplace):
         if self.dual_directions is None:
             raise RuntimeError("Call fit before requesting ELLA features.")
         # BackPACK extends modules in-place and is incompatible with torch.func.jvp.
-        if "backpack" not in self._backend_cls.__name__.lower():
+        if not self._uses_backpack_backend:
             parameters = dict(self.model.named_parameters())
             buffers = dict(self.model.named_buffers())
             feature_columns = []
@@ -3566,7 +3610,7 @@ class ELLA(BaseFunctionalLaplace):
                 return torch.stack(feature_columns, dim=-1), output
         if (
             self.likelihood == Likelihood.REWARD_MODELING
-            and "backpack" in self._backend_cls.__name__.lower()
+            and self._uses_backpack_backend
             and (query_shape := self.model(x).shape)[-1] == 1
         ):
             selectors = torch.zeros(
@@ -3577,7 +3621,7 @@ class ELLA(BaseFunctionalLaplace):
             )
         elif (
             self.likelihood == Likelihood.REWARD_MODELING
-            and "backpack" not in self._backend_cls.__name__.lower()
+            and not self._uses_backpack_backend
         ):
             jacobians, output = CurvatureInterface.jacobians(
                 self.backend, x, enable_backprop=self.enable_backprop
@@ -3619,10 +3663,7 @@ class ELLA(BaseFunctionalLaplace):
         self._fitted = False
         self.n_data = len(training_indices(train_loader))
         first_x, _ = self._batch(next(iter(train_loader)))
-        if (
-            isinstance(first_x, MutableMapping)
-            and "backpack" in self._backend_cls.__name__.lower()
-        ):
+        if isinstance(first_x, MutableMapping) and self._uses_backpack_backend:
             raise ValueError(
                 "BackPACK does not support mapping-style inputs; use AsdlGGN or CurvlinopsGGN."
             )
@@ -3844,6 +3885,8 @@ class ELLA(BaseFunctionalLaplace):
             "n_outputs": self.n_outputs,
             "fitted": self._fitted,
             "fit_history": deepcopy(self.fit_history_),
+            "seed": self.seed,
+            **self._checkpoint_configuration(),
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
@@ -3858,7 +3901,9 @@ class ELLA(BaseFunctionalLaplace):
             )
         if state_dict["likelihood"] != self.likelihood:
             raise ValueError("Checkpoint likelihood does not match.")
+        self._validate_checkpoint_configuration(state_dict)
         check_model_fingerprint(self.model, state_dict["model_fingerprint"])
+        self.seed = state_dict["seed"]
         self.subsample_size = state_dict["subsample_size"]
         self.n_eigenvalues = state_dict["n_eigenvalues"]
         self.dual_directions = state_dict["dual_directions"].to(self._device)
@@ -4158,9 +4203,9 @@ class VaLLA(BaseFunctionalLaplace):
     def _query_jacobians(
         self, x: torch.Tensor | MutableMapping, *, differentiable: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if "asdl" in self._backend_cls.__name__.lower() or (
+        if self._uses_asdl_backend or (
             self.likelihood == Likelihood.REWARD_MODELING
-            and "backpack" not in self._backend_cls.__name__.lower()
+            and not self._uses_backpack_backend
         ):
             return CurvatureInterface.jacobians(
                 self.backend, x, enable_backprop=differentiable
@@ -4189,12 +4234,80 @@ class VaLLA(BaseFunctionalLaplace):
     def _inducing_term(
         self, jacobians: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        kernel = jacobians @ jacobians.T / self.prior_precision
-        factor = self._factor_matrix()
-        identity = torch.eye(self.num_inducing, device=self._device, dtype=self._dtype)
+        # In float32, adding the identity to a large kernel can round it away
+        # and make an otherwise positive definite system appear singular.
+        work_dtype = (
+            torch.float64 if jacobians.dtype != torch.float64 else jacobians.dtype
+        )
+        jacobians = jacobians.to(work_dtype)
+        kernel = jacobians @ jacobians.T / self.prior_precision.to(work_dtype)
+        factor = self._factor_matrix().to(work_dtype)
+        identity = torch.eye(self.num_inducing, device=self._device, dtype=work_dtype)
         hessian = identity + factor.T @ kernel @ factor
         correction = factor @ torch.linalg.solve(hessian, factor.T)
         return kernel, hessian, correction
+
+    def _posterior_covariance(
+        self,
+        jacobians: torch.Tensor,
+        inducing_jacobians: torch.Tensor,
+        *,
+        joint: bool,
+    ) -> torch.Tensor:
+        """Form a PSD covariance without subtracting nearly equal kernels."""
+        work_dtype = (
+            torch.float64 if jacobians.dtype != torch.float64 else jacobians.dtype
+        )
+        prior_scale = self.prior_precision.to(work_dtype).sqrt()
+        query = jacobians.to(work_dtype).reshape(-1, self.n_params) / prior_scale
+        inducing = inducing_jacobians.to(work_dtype)
+        factor = self._factor_matrix().to(work_dtype)
+        feature_map = (factor.T @ inducing / prior_scale).T
+        basis, triangular = torch.linalg.qr(feature_map, mode="reduced")
+
+        # QR derivatives are undefined for a rank-deficient feature map. The
+        # double-precision Woodbury form remains differentiable in that case.
+        diagonal = triangular.diagonal()
+        tolerance = (
+            torch.finfo(work_dtype).eps
+            * max(triangular.shape)
+            * torch.linalg.vector_norm(triangular.detach())
+        )
+        if torch.any(diagonal.abs() <= tolerance):
+            projected = query @ feature_map
+            small = (
+                torch.eye(feature_map.shape[1], device=query.device, dtype=work_dtype)
+                + feature_map.T @ feature_map
+            )
+            solved = torch.linalg.solve(small, projected.T).T
+            if joint:
+                covariance = query @ query.T - projected @ solved.T
+            else:
+                batch, outputs = jacobians.shape[:2]
+                query = query.reshape(batch, outputs, -1)
+                projected = projected.reshape(batch, outputs, -1)
+                solved = solved.reshape(batch, outputs, -1)
+                covariance = torch.einsum("bcp,bdp->bcd", query, query)
+                covariance -= torch.einsum("bcm,bdm->bcd", projected, solved)
+        else:
+            projected = query @ basis
+            residual = query - projected @ basis.T
+            small = (
+                torch.eye(triangular.shape[0], device=query.device, dtype=work_dtype)
+                + triangular @ triangular.T
+            )
+            scaled = torch.linalg.solve_triangular(
+                torch.linalg.cholesky(small), projected.T, upper=False
+            ).T
+            roots = torch.cat((residual, scaled), dim=-1)
+            if joint:
+                covariance = roots @ roots.T
+            else:
+                batch, outputs = jacobians.shape[:2]
+                roots = roots.reshape(batch, outputs, -1)
+                covariance = torch.einsum("bcp,bdp->bcd", roots, roots)
+        covariance = (covariance + covariance.transpose(-1, -2)) / 2
+        return covariance.to(jacobians.dtype)
 
     def _latent_distribution(
         self, x: torch.Tensor | MutableMapping, joint: bool = False
@@ -4203,24 +4316,9 @@ class VaLLA(BaseFunctionalLaplace):
         jacobians, mean = self._query_jacobians(x, differentiable=self.enable_backprop)
         inducing_jacobians = self._inducing_jacobians()
         kernel_zz, hessian, correction = self._inducing_term(inducing_jacobians)
-        if joint:
-            flat = jacobians.reshape(-1, self.n_params)
-            prior = flat @ flat.T / self.prior_precision
-            cross = flat @ inducing_jacobians.T / self.prior_precision
-            covariance = prior - cross @ correction @ cross.T
-        else:
-            prior = (
-                torch.einsum("bcp,bdp->bcd", jacobians, jacobians)
-                / self.prior_precision
-            )
-            cross = (
-                torch.einsum("bcp,mp->bcm", jacobians, inducing_jacobians)
-                / self.prior_precision
-            )
-            covariance = prior - torch.einsum(
-                "bcm,mn,bdn->bcd", cross, correction, cross
-            )
-        covariance = (covariance + covariance.transpose(-1, -2)) / 2
+        covariance = self._posterior_covariance(
+            jacobians, inducing_jacobians, joint=joint
+        )
         return mean, covariance, kernel_zz, hessian, correction
 
     @torch.enable_grad()
@@ -4238,22 +4336,13 @@ class VaLLA(BaseFunctionalLaplace):
         self._check_fitted()
         self._check_jacobians(jacobians)
         inducing = self._inducing_jacobians()
-        _, _, correction = self._inducing_term(inducing)
-        prior = (
-            torch.einsum("bcp,bdp->bcd", jacobians, jacobians) / self.prior_precision
-        )
-        cross = jacobians @ inducing.T / self.prior_precision
-        return prior - torch.einsum("bcm,mn,bdn->bcd", cross, correction, cross)
+        return self._posterior_covariance(jacobians, inducing, joint=False)
 
     def functional_covariance(self, jacobians: torch.Tensor) -> torch.Tensor:
         self._check_fitted()
         self._check_jacobians(jacobians)
         inducing = self._inducing_jacobians()
-        _, _, correction = self._inducing_term(inducing)
-        flat = jacobians.reshape(-1, self.n_params)
-        prior = flat @ flat.T / self.prior_precision
-        cross = flat @ inducing.T / self.prior_precision
-        return prior - cross @ correction @ cross.T
+        return self._posterior_covariance(jacobians, inducing, joint=True)
 
     def _objective(self, x: Any, y: torch.Tensor) -> torch.Tensor:
         mean, covariance, kernel, hessian, correction = self._latent_distribution(x)
@@ -4369,10 +4458,7 @@ class VaLLA(BaseFunctionalLaplace):
         self.model.eval()
         self.n_data = len(training_indices(train_loader))
         x_first, _ = self._batch(next(iter(train_loader)))
-        if (
-            isinstance(x_first, MutableMapping)
-            and "backpack" in self._backend_cls.__name__.lower()
-        ):
+        if isinstance(x_first, MutableMapping) and self._uses_backpack_backend:
             raise ValueError(
                 "BackPACK does not support mapping-style inputs; use AsdlGGN or CurvlinopsGGN."
             )
@@ -4474,6 +4560,9 @@ class VaLLA(BaseFunctionalLaplace):
             "n_outputs": self.n_outputs,
             "fitted": self._fitted,
             "fit_history": deepcopy(self.fit_history_),
+            "seed": self.seed,
+            "generator_state": self.generator.get_state().clone(),
+            **self._checkpoint_configuration(),
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
@@ -4488,7 +4577,10 @@ class VaLLA(BaseFunctionalLaplace):
             )
         if state_dict["likelihood"] != self.likelihood:
             raise ValueError("Checkpoint likelihood does not match.")
+        self._validate_checkpoint_configuration(state_dict)
         check_model_fingerprint(self.model, state_dict["model_fingerprint"])
+        self.seed = state_dict["seed"]
+        self.generator.set_state(state_dict["generator_state"])
         self.inducing_locations = self._make_inducing(state_dict["inducing_locations"])
         self.inducing_classes = state_dict["inducing_classes"].to(self._device)
         self.num_inducing = len(self.inducing_classes)
