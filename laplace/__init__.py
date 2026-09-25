@@ -8,6 +8,7 @@
 """
 
 from laplace.baselaplace import (
+    ELLA,
     BaseFunctionalLaplace,
     BaseLaplace,
     DiagLaplace,
@@ -16,8 +17,8 @@ from laplace.baselaplace import (
     KronLaplace,
     LowRankLaplace,
     ParametricLaplace,
+    VaLLA,
 )
-from laplace.ella import ELLA
 from laplace.laplace import Laplace
 from laplace.lllaplace import (
     DiagLLLaplace,
@@ -38,7 +39,6 @@ from laplace.utils.enums import (
     SubsetOfWeights,
     TuningMethod,
 )
-from laplace.valla import VaLLA
 
 __all__ = [
     "ELLA",
