@@ -139,9 +139,15 @@ class FeatureExtractor(nn.Module):
         """
         # set last_layer attributes and check if it is linear
         self._last_layer_name = last_layer_name
-        self.last_layer = dict(self.model.named_modules())[last_layer_name]
-        if not isinstance(self.last_layer, nn.Linear):
+        last_layer = dict(self.model.named_modules())[last_layer_name]
+        if not isinstance(last_layer, nn.Linear):
             raise ValueError("Use model with a linear last layer.")
+
+        # The layer is already registered under self.model. Registering it again as
+        # self.last_layer can make functional_call replace its parameters, leaving
+        # curvature backends with stale parameter references on subsequent calls.
+        self._modules.pop("last_layer", None)
+        object.__setattr__(self, "last_layer", last_layer)
 
         # set forward hook to extract features in future forward passes
         self.last_layer.register_forward_hook(self._get_hook(last_layer_name))
