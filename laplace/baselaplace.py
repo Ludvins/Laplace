@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader
 from laplace._functional_utils import (
     check_model_fingerprint,
     classification_targets,
+    concatenate_rows,
     individual_reward_inputs,
     model_fingerprint,
     preserve_model_gradients,
@@ -30,6 +31,7 @@ from laplace._functional_utils import (
     split_batch,
     subset_loader,
     to_device,
+    training_epoch,
     training_indices,
 )
 from laplace.curvature.asdfghjkl import AsdfghjklHessian, AsdfghjklInterface
@@ -3510,7 +3512,7 @@ class ELLA(BaseFunctionalLaplace):
 
     @prior_precision.setter
     def prior_precision(self, value: float | torch.Tensor) -> None:
-        candidate = torch.as_tensor(value)
+        candidate = torch.as_tensor(value, device=self._device, dtype=self._dtype)
         if candidate.numel() != 1 or not torch.all(
             torch.isfinite(candidate) & (candidate > 0)
         ):
@@ -3535,7 +3537,7 @@ class ELLA(BaseFunctionalLaplace):
 
     @sigma_noise.setter
     def sigma_noise(self, value: float | torch.Tensor) -> None:
-        candidate = torch.as_tensor(value)
+        candidate = torch.as_tensor(value, device=self._device, dtype=self._dtype)
         if not torch.all(torch.isfinite(candidate) & (candidate > 0)):
             raise ValueError("sigma_noise must be positive and finite.")
         if self.likelihood != Likelihood.REGRESSION and torch.any(
@@ -3562,8 +3564,13 @@ class ELLA(BaseFunctionalLaplace):
         x, y = split_batch(batch, self.dict_key_y)
         return to_device(x, self._device, self._dtype), y.to(self._device)
 
-    def _indices(self, loader: DataLoader, balanced: bool) -> torch.Tensor:
-        available = training_indices(loader)
+    def _indices(
+        self,
+        loader: DataLoader,
+        balanced: bool,
+        available: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        available = training_indices(loader) if available is None else available
         n = len(available)
         if self.subsample_size > n:
             raise ValueError("subsample_size cannot exceed the training set size.")
@@ -3742,26 +3749,29 @@ class ELLA(BaseFunctionalLaplace):
         self.model.eval()
         self.fit_history_ = {"processed_examples": [], "val_nll": [], "tuning": []}
         self._fitted = False
-        self.n_data = len(training_indices(train_loader))
-        first_x, _ = self._batch(next(iter(train_loader)))
+        fit_loader, available = training_epoch(train_loader)
+        self.n_data = len(available)
+        first_x, _ = self._batch(next(iter(fit_loader)))
         if isinstance(first_x, MutableMapping) and self._uses_backpack_backend:
             raise ValueError(
                 "BackPACK does not support mapping-style inputs; use AsdlGGN or CurvlinopsGGN."
             )
         self.n_outputs = self.model(first_x).shape[-1]
         setattr(self.model, "output_size", self.n_outputs)
-        self._build_basis(train_loader, self._indices(train_loader, balanced))
+        self._build_basis(
+            train_loader, self._indices(train_loader, balanced, available)
+        )
         self.feature_gram = torch.zeros(
             self.n_eigenvalues,
             self.n_eigenvalues,
             device=self._device,
             dtype=self._dtype,
         )
-        iterator = train_loader
+        iterator = fit_loader
         if progress_bar:
             from tqdm import tqdm
 
-            iterator = tqdm(train_loader, desc="Fitting ELLA")
+            iterator = tqdm(fit_loader, desc="Fitting ELLA")
         processed = 0
         for step, batch in enumerate(iterator, start=1):
             x, y = self._batch(batch)
@@ -4148,7 +4158,7 @@ class VaLLA(BaseFunctionalLaplace):
 
     @prior_precision.setter
     def prior_precision(self, value: float | torch.Tensor) -> None:
-        candidate = torch.as_tensor(value)
+        candidate = torch.as_tensor(value, device=self._device, dtype=self._dtype)
         if candidate.numel() != 1 or not torch.all(
             torch.isfinite(candidate) & (candidate > 0)
         ):
@@ -4187,7 +4197,7 @@ class VaLLA(BaseFunctionalLaplace):
 
     @sigma_noise.setter
     def sigma_noise(self, value: float | torch.Tensor) -> None:
-        candidate = torch.as_tensor(value)
+        candidate = torch.as_tensor(value, device=self._device, dtype=self._dtype)
         if not torch.all(torch.isfinite(candidate) & (candidate > 0)):
             raise ValueError("sigma_noise must be positive and finite.")
         if self.likelihood != Likelihood.REGRESSION and torch.any(
@@ -4279,13 +4289,7 @@ class VaLLA(BaseFunctionalLaplace):
             classes.append(labels)
         if not candidates:
             raise ValueError("Cannot initialize inducing inputs from an empty loader.")
-        if isinstance(candidates[0], MutableMapping):
-            inputs = {
-                key: torch.cat([candidate[key] for candidate in candidates], dim=0)
-                for key in candidates[0]
-            }
-        else:
-            inputs = torch.cat(candidates, dim=0)
+        inputs = concatenate_rows(candidates)
         labels = torch.cat(classes)
         available = labels.shape[0]
         if available < self.num_inducing:
@@ -4303,7 +4307,9 @@ class VaLLA(BaseFunctionalLaplace):
             indices = torch.randperm(
                 available, generator=torch.Generator().manual_seed(self.seed)
             )[: self.num_inducing].to(self._device)
-        self.inducing_locations = self._make_inducing(select_rows(inputs, indices))
+        self.inducing_locations = self._make_inducing(
+            select_rows(inputs, indices, available)
+        )
         self.inducing_classes = labels[indices].long()
 
     def _query_jacobians(

@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 import torch
 from torch.utils.data import (
+    BatchSampler,
     DataLoader,
     RandomSampler,
     SequentialSampler,
@@ -112,6 +113,49 @@ def training_indices(loader: DataLoader) -> torch.Tensor:
     return result
 
 
+def training_epoch(loader: DataLoader) -> tuple[DataLoader, torch.Tensor]:
+    """Replay one sampled epoch when the loader's row set may change per pass."""
+    batch_sampler = loader.batch_sampler
+    sampler = getattr(batch_sampler, "sampler", None)
+    drop_last = getattr(batch_sampler, "drop_last", False)
+    fixed_rows = type(batch_sampler) is BatchSampler and (
+        isinstance(sampler, SequentialSampler)
+        or (
+            isinstance(sampler, RandomSampler)
+            and not sampler.replacement
+            and sampler.num_samples == len(loader.dataset)
+            and not drop_last
+        )
+        or (isinstance(sampler, SubsetRandomSampler) and not drop_last)
+    )
+    if fixed_rows:
+        return loader, training_indices(loader)
+
+    batches = [list(batch) for batch in batch_sampler]
+    indices = torch.as_tensor(
+        [index for batch in batches for index in batch], dtype=torch.long
+    )
+    if indices.ndim != 1 or indices.numel() == 0:
+        raise ValueError("A function-space fit requires a nonempty index sampler.")
+    if torch.any(indices < 0) or torch.any(indices >= len(loader.dataset)):
+        raise ValueError("The training sampler yielded an invalid dataset index.")
+    replay = DataLoader(
+        loader.dataset,
+        batch_sampler=batches,
+        collate_fn=loader.collate_fn,
+        num_workers=loader.num_workers,
+        pin_memory=loader.pin_memory,
+        timeout=loader.timeout,
+        worker_init_fn=loader.worker_init_fn,
+        multiprocessing_context=loader.multiprocessing_context,
+        generator=loader.generator,
+        prefetch_factor=loader.prefetch_factor,
+        persistent_workers=loader.persistent_workers,
+        pin_memory_device=getattr(loader, "pin_memory_device", ""),
+    )
+    return replay, indices
+
+
 def subset_loader(loader: DataLoader, indices: torch.Tensor) -> DataLoader:
     batch_size = loader.batch_size or getattr(loader.batch_sampler, "batch_size", 1)
     return DataLoader(
@@ -128,13 +172,38 @@ def batch_size(inputs: Any, dict_key_x: str) -> int:
     return inputs.shape[0]
 
 
-def select_rows(inputs: Any, indices: torch.Tensor) -> Any:
+def concatenate_rows(chunks: list[Any]) -> Any:
+    """Join batched tensor or mapping inputs, including per-row metadata."""
+    first = chunks[0]
+    if isinstance(first, torch.Tensor):
+        return torch.cat(chunks, dim=0)
+    if isinstance(first, MutableMapping):
+        if any(chunk.keys() != first.keys() for chunk in chunks):
+            raise ValueError("Mapping batches must have matching input keys.")
+        return {
+            key: concatenate_rows([chunk[key] for chunk in chunks]) for key in first
+        }
+    if isinstance(first, (list, tuple)):
+        return type(first)(item for chunk in chunks for item in chunk)
+    if all(chunk == first for chunk in chunks):
+        return first
+    raise ValueError("Cannot combine non-batched mapping metadata across batches.")
+
+
+def select_rows(inputs: Any, indices: torch.Tensor, batch_size: int) -> Any:
     if isinstance(inputs, MutableMapping):
         return {
-            key: value[indices] if isinstance(value, torch.Tensor) else value
+            key: select_rows(value, indices, batch_size)
             for key, value in inputs.items()
         }
-    return inputs[indices]
+    if isinstance(inputs, torch.Tensor):
+        return (
+            inputs[indices] if inputs.ndim and inputs.shape[0] == batch_size else inputs
+        )
+    if isinstance(inputs, (list, tuple)) and len(inputs) == batch_size:
+        row_indices = indices.detach().cpu().tolist()
+        return type(inputs)(inputs[index] for index in row_indices)
+    return inputs
 
 
 def individual_reward_inputs(inputs: Any, dict_key_x: str) -> Any:
@@ -156,6 +225,8 @@ def individual_reward_inputs(inputs: Any, dict_key_x: str) -> Any:
                 if isinstance(value, torch.Tensor)
                 and value.ndim >= 1
                 and value.shape[0] == batch
+                else type(value)(item for entry in value for item in (entry, entry))
+                if isinstance(value, (list, tuple)) and len(value) == batch
                 else value
             )
             for key, value in inputs.items()
