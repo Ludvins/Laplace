@@ -5,7 +5,8 @@ from collections import deque
 from collections.abc import MutableMapping
 from copy import deepcopy
 from importlib.util import find_spec
-from math import log, pi, sqrt
+from math import isfinite, log, pi, sqrt
+from numbers import Integral
 from typing import Any, Callable
 
 import numpy as np
@@ -3460,14 +3461,22 @@ class ELLA(BaseFunctionalLaplace):
         backend_kwargs: dict[str, Any] | None = None,
         seed: int = 1234,
     ) -> None:
-        if subsample_size <= 0 or n_eigenvalues <= 0 or n_eigenvalues > subsample_size:
+        if (
+            not isinstance(subsample_size, Integral)
+            or isinstance(subsample_size, bool)
+            or not isinstance(n_eigenvalues, Integral)
+            or isinstance(n_eigenvalues, bool)
+            or subsample_size <= 0
+            or n_eigenvalues <= 0
+            or n_eigenvalues > subsample_size
+        ):
             raise ValueError("Require 0 < n_eigenvalues <= subsample_size.")
         if torch.as_tensor(prior_precision).numel() != 1:
             raise ValueError("ELLA requires scalar prior_precision.")
         if torch.any(torch.as_tensor(prior_mean) != 0):
             raise ValueError("ELLA currently requires prior_mean=0.")
-        if temperature <= 0:
-            raise ValueError("temperature must be positive.")
+        if not isfinite(temperature) or temperature <= 0:
+            raise ValueError("temperature must be positive and finite.")
         super().__init__(
             model,
             likelihood,
@@ -3501,10 +3510,11 @@ class ELLA(BaseFunctionalLaplace):
 
     @prior_precision.setter
     def prior_precision(self, value: float | torch.Tensor) -> None:
-        if torch.as_tensor(value).numel() != 1 or torch.any(
-            torch.as_tensor(value) <= 0
+        candidate = torch.as_tensor(value)
+        if candidate.numel() != 1 or not torch.all(
+            torch.isfinite(candidate) & (candidate > 0)
         ):
-            raise ValueError("ELLA requires positive scalar prior_precision.")
+            raise ValueError("ELLA requires positive finite scalar prior_precision.")
         BaseLaplace.prior_precision.fset(self, value)  # type: ignore[attr-defined]
         if hasattr(self, "feature_gram") and self.feature_gram is not None:
             self._posterior_dirty = True
@@ -3525,8 +3535,9 @@ class ELLA(BaseFunctionalLaplace):
 
     @sigma_noise.setter
     def sigma_noise(self, value: float | torch.Tensor) -> None:
-        if torch.any(torch.as_tensor(value) <= 0):
-            raise ValueError("sigma_noise must be positive.")
+        candidate = torch.as_tensor(value)
+        if not torch.all(torch.isfinite(candidate) & (candidate > 0)):
+            raise ValueError("sigma_noise must be positive and finite.")
         if self.likelihood != Likelihood.REGRESSION and torch.any(
             torch.as_tensor(value) != 1
         ):
@@ -3541,8 +3552,8 @@ class ELLA(BaseFunctionalLaplace):
 
     @temperature.setter
     def temperature(self, value: float) -> None:
-        if value <= 0:
-            raise ValueError("temperature must be positive.")
+        if not isfinite(value) or value <= 0:
+            raise ValueError("temperature must be positive and finite.")
         self._temperature = value
         if hasattr(self, "feature_gram") and self.feature_gram is not None:
             self._posterior_dirty = True
@@ -3677,6 +3688,19 @@ class ELLA(BaseFunctionalLaplace):
             jacobians, output = CurvatureInterface.jacobians(
                 self.backend, x, enable_backprop=self.enable_backprop
             )
+        elif self._uses_asdl_backend:
+            # Reverse-mode torch.func can retain input derivatives when the
+            # model does not support JVP; ASDL's Jacobians can detach them.
+            try:
+                jacobians, output = CurvatureInterface.jacobians(
+                    self.backend, x, enable_backprop=self.enable_backprop
+                )
+            except (NotImplementedError, RuntimeError) as exc:
+                if self.enable_backprop:
+                    raise RuntimeError(
+                        "This model cannot provide differentiable ELLA Jacobians."
+                    ) from exc
+                jacobians, output = self.backend.jacobians(x)
         else:
             jacobians, output = self.backend.jacobians(
                 x, enable_backprop=self.enable_backprop
@@ -3709,8 +3733,12 @@ class ELLA(BaseFunctionalLaplace):
         balanced: bool = False,
         progress_bar: bool = False,
     ) -> None:
-        if val_steps is not None and val_steps <= 0:
-            raise ValueError("val_steps must be positive when provided.")
+        if val_steps is not None and (
+            not isinstance(val_steps, Integral)
+            or isinstance(val_steps, bool)
+            or val_steps <= 0
+        ):
+            raise ValueError("val_steps must be positive integer when provided.")
         self.model.eval()
         self.fit_history_ = {"processed_examples": [], "val_nll": [], "tuning": []}
         self._fitted = False
@@ -3785,6 +3813,7 @@ class ELLA(BaseFunctionalLaplace):
         self._check_jacobians(jacobians)
         return self._feature_covariance(jacobians @ self.dual_directions)
 
+    @preserve_model_gradients
     @torch.enable_grad()
     def _glm_predictive_distribution(
         self, x: torch.Tensor | MutableMapping, joint: bool = False
@@ -3875,8 +3904,12 @@ class ELLA(BaseFunctionalLaplace):
             )
         if val_loader is None:
             raise ValueError("gridsearch requires val_loader.")
-        if grid_size <= 0:
-            raise ValueError("grid_size must be positive.")
+        if (
+            not isinstance(grid_size, Integral)
+            or isinstance(grid_size, bool)
+            or grid_size <= 0
+        ):
+            raise ValueError("grid_size must be positive integer.")
         grid = torch.logspace(log_prior_prec_min, log_prior_prec_max, grid_size)
         self.optimize_hyperparameters(val_loader, grid)
 
@@ -4010,8 +4043,8 @@ class VaLLA(BaseFunctionalLaplace):
             raise ValueError("VaLLA requires scalar prior_precision.")
         if torch.any(torch.as_tensor(prior_mean) != 0):
             raise ValueError("VaLLA currently requires prior_mean=0.")
-        if temperature <= 0:
-            raise ValueError("temperature must be positive.")
+        if not isfinite(temperature) or temperature <= 0:
+            raise ValueError("temperature must be positive and finite.")
         if not 0 <= alpha <= 1:
             raise ValueError("alpha must be in [0, 1].")
         if not isinstance(mc_softmax_samples, int) or mc_softmax_samples < 0:
@@ -4061,9 +4094,13 @@ class VaLLA(BaseFunctionalLaplace):
                 "inducing_locations must be inputs, 'random', or 'kmeans'."
             )
         if isinstance(inducing_locations, str):
-            if num_inducing is None or num_inducing <= 0:
+            if (
+                not isinstance(num_inducing, Integral)
+                or isinstance(num_inducing, bool)
+                or num_inducing <= 0
+            ):
                 raise ValueError(
-                    "num_inducing must be positive for an inducing strategy."
+                    "num_inducing must be a positive integer for an inducing strategy."
                 )
             self.num_inducing = num_inducing
             self.inducing_locations = None
@@ -4074,8 +4111,12 @@ class VaLLA(BaseFunctionalLaplace):
                 if isinstance(self.inducing_locations, MutableMapping)
                 else self.inducing_locations.shape[0]
             )
-            if num_inducing is not None and num_inducing != count:
-                raise ValueError("num_inducing does not match inducing_locations.")
+            if num_inducing is not None and (
+                not isinstance(num_inducing, Integral)
+                or isinstance(num_inducing, bool)
+                or num_inducing != count
+            ):
+                raise ValueError("num_inducing must match inducing_locations.")
             self.num_inducing = count
         if self.num_inducing <= 0:
             raise ValueError("At least one inducing location is required.")
@@ -4107,10 +4148,11 @@ class VaLLA(BaseFunctionalLaplace):
 
     @prior_precision.setter
     def prior_precision(self, value: float | torch.Tensor) -> None:
-        if torch.as_tensor(value).numel() != 1 or torch.any(
-            torch.as_tensor(value) <= 0
+        candidate = torch.as_tensor(value)
+        if candidate.numel() != 1 or not torch.all(
+            torch.isfinite(candidate) & (candidate > 0)
         ):
-            raise ValueError("VaLLA requires positive scalar prior_precision.")
+            raise ValueError("VaLLA requires positive finite scalar prior_precision.")
         BaseLaplace.prior_precision.fset(self, value)  # type: ignore[attr-defined]
         if hasattr(self, "log_prior_precision"):
             with torch.no_grad():
@@ -4127,6 +4169,16 @@ class VaLLA(BaseFunctionalLaplace):
         BaseLaplace.prior_mean.fset(self, value)  # type: ignore[attr-defined]
 
     @property
+    def temperature(self) -> float:
+        return self._temperature
+
+    @temperature.setter
+    def temperature(self, value: float) -> None:
+        if not isfinite(value) or value <= 0:
+            raise ValueError("temperature must be positive and finite.")
+        self._temperature = value
+
+    @property
     def sigma_noise(self) -> torch.Tensor:
         log_noise_variance = getattr(self, "log_noise_variance", None)
         if isinstance(log_noise_variance, torch.Tensor):
@@ -4135,8 +4187,9 @@ class VaLLA(BaseFunctionalLaplace):
 
     @sigma_noise.setter
     def sigma_noise(self, value: float | torch.Tensor) -> None:
-        if torch.any(torch.as_tensor(value) <= 0):
-            raise ValueError("sigma_noise must be positive.")
+        candidate = torch.as_tensor(value)
+        if not torch.all(torch.isfinite(candidate) & (candidate > 0)):
+            raise ValueError("sigma_noise must be positive and finite.")
         if self.likelihood != Likelihood.REGRESSION and torch.any(
             torch.as_tensor(value) != 1
         ):
@@ -4337,6 +4390,7 @@ class VaLLA(BaseFunctionalLaplace):
         )
         return mean, covariance, features, triangular
 
+    @preserve_model_gradients
     @torch.enable_grad()
     def _glm_predictive_distribution(
         self, x: torch.Tensor | MutableMapping, joint: bool = False
@@ -4348,12 +4402,14 @@ class VaLLA(BaseFunctionalLaplace):
             return mean.detach(), covariance.detach()
         return mean, covariance
 
+    @preserve_model_gradients
     def functional_variance(self, jacobians: torch.Tensor) -> torch.Tensor:
         self._check_fitted()
         self._check_jacobians(jacobians)
         inducing = self._inducing_jacobians()
         return self._posterior_covariance(jacobians, inducing, joint=False)
 
+    @preserve_model_gradients
     def functional_covariance(self, jacobians: torch.Tensor) -> torch.Tensor:
         self._check_fitted()
         self._check_jacobians(jacobians)
@@ -4454,12 +4510,24 @@ class VaLLA(BaseFunctionalLaplace):
         progress_bar: bool = False,
         override: bool = True,
     ) -> None:
-        if iterations <= 0 or lr <= 0:
-            raise ValueError("iterations and lr must be positive.")
-        if val_steps is not None and val_steps <= 0:
-            raise ValueError("val_steps must be positive when provided.")
-        if self.temperature <= 0:
-            raise ValueError("temperature must be positive.")
+        if (
+            not isinstance(iterations, Integral)
+            or isinstance(iterations, bool)
+            or iterations <= 0
+            or not isfinite(lr)
+            or lr <= 0
+        ):
+            raise ValueError(
+                "iterations must be a positive integer and lr positive and finite."
+            )
+        if val_steps is not None and (
+            not isinstance(val_steps, Integral)
+            or isinstance(val_steps, bool)
+            or val_steps <= 0
+        ):
+            raise ValueError("val_steps must be positive integer when provided.")
+        if not isfinite(self.temperature) or self.temperature <= 0:
+            raise ValueError("temperature must be positive and finite.")
         if not 0 <= self.alpha <= 1:
             raise ValueError("alpha must be in [0, 1].")
         if not isinstance(self.mc_softmax_samples, int) or self.mc_softmax_samples < 0:
