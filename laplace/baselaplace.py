@@ -663,32 +663,56 @@ class BaseLaplace:
             kappa = 1 / torch.sqrt(1.0 + np.pi / 8 * f_var.diagonal(dim1=1, dim2=2))
             return torch.softmax(kappa * f_mu, dim=-1)
         elif "bridge" in link_approx:
-            # zero mean correction
-            f_mu -= (
-                f_var.sum(-1)
-                * f_mu.sum(-1).reshape(-1, 1)
-                / f_var.sum(dim=(1, 2)).reshape(-1, 1)
+            _, K = f_mu.shape
+            if K == 1:
+                return torch.ones_like(f_mu)
+            raw_mu, raw_var = f_mu, f_var
+
+            # A zero-sum covariance is already centered and needs no correction.
+            row_sums = f_var.sum(dim=-1)
+            sum_variance = f_var.sum(dim=(1, 2), keepdim=True)
+            centered = sum_variance.abs() <= (
+                torch.finfo(f_var.dtype).eps * f_var.abs().sum(dim=(1, 2), keepdim=True)
             )
-            f_var -= torch.einsum(
-                "bi,bj->bij", f_var.sum(-1), f_var.sum(-2)
-            ) / f_var.sum(dim=(1, 2)).reshape(-1, 1, 1)
+            safe_variance = torch.where(centered, 1, sum_variance)
+            ratio = torch.where(
+                centered.squeeze(-1), 0, row_sums / safe_variance.squeeze(-1)
+            )
+            f_mu = f_mu - torch.where(
+                centered.squeeze(-1),
+                f_mu.mean(dim=-1, keepdim=True),
+                ratio * f_mu.sum(dim=-1, keepdim=True),
+            )
+            f_var = f_var - ratio.unsqueeze(-1) * row_sums.unsqueeze(-2)
+            f_var_diag = f_var.diagonal(dim1=-2, dim2=-1)
+            valid_variance = (f_var_diag > 0).all(dim=-1, keepdim=True)
 
-            # Laplace Bridge
-            _, K = f_mu.size(0), f_mu.size(-1)
-            f_var_diag = torch.diagonal(f_var, dim1=1, dim2=2)
-
-            # optional: variance correction
             if link_approx == LinkApprox.BRIDGE_NORM:
-                f_var_diag_mean = f_var_diag.mean(dim=1)
-                f_var_diag_mean /= torch.as_tensor(
-                    [K / 2], device=self._device, dtype=self._dtype
-                ).sqrt()
-                f_mu /= f_var_diag_mean.sqrt().unsqueeze(-1)
-                f_var_diag /= f_var_diag_mean.unsqueeze(-1)
+                variance_scale = f_var_diag.mean(dim=-1, keepdim=True) / sqrt(K / 2)
+                valid_variance &= variance_scale > 0
+                safe_scale = torch.where(variance_scale > 0, variance_scale, 1)
+                f_mu = f_mu / safe_scale.sqrt()
+                f_var_diag = f_var_diag / safe_scale
 
-            sum_exp = torch.exp(-f_mu).sum(dim=1).unsqueeze(-1)
-            alpha = (1 - 2 / K + f_mu.exp() / K**2 * sum_exp) / f_var_diag
-            return torch.nan_to_num(alpha / alpha.sum(dim=1).unsqueeze(-1), nan=1.0)
+            # Normalize the Bridge's Dirichlet parameters in log space.
+            log_component = (
+                f_mu + torch.logsumexp(-f_mu, dim=-1, keepdim=True) - 2 * log(K)
+            )
+            log_base = log(1 - 2 / K) if K > 2 else -float("inf")
+            log_numerator = torch.logaddexp(
+                torch.full_like(log_component, log_base), log_component
+            )
+            log_alpha = (
+                log_numerator
+                - f_var_diag.clamp_min(torch.finfo(f_var_diag.dtype).tiny).log()
+            )
+            probabilities = torch.softmax(log_alpha, dim=-1)
+            fallback_variance = raw_var.diagonal(dim1=-2, dim2=-1).clamp_min(0)
+            fallback = torch.softmax(
+                raw_mu / torch.sqrt(1 + np.pi / 8 * fallback_variance), dim=-1
+            )
+            valid_variance &= torch.isfinite(probabilities).all(dim=-1, keepdim=True)
+            return torch.where(valid_variance, probabilities, fallback)
         else:
             raise ValueError(
                 "Prediction path invalid. Check the likelihood, pred_type, link_approx combination!"
