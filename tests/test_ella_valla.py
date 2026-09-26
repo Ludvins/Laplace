@@ -603,6 +603,109 @@ def test_ella_noise_and_validation_grid(data):
         estimator.optimize_prior_precision(method="marglik", val_loader=loader)
 
 
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_classification_validation_nll_is_stable_for_saturated_probabilities(method):
+    inputs = torch.ones(4, 1)
+    train = DataLoader(
+        TensorDataset(inputs, torch.zeros(4, dtype=torch.long)), batch_size=2
+    )
+    validation_targets = torch.ones(4, dtype=torch.long)
+    validation = DataLoader(TensorDataset(inputs, validation_targets), batch_size=2)
+    model = torch.nn.Linear(1, 2)
+    with torch.no_grad():
+        model.weight.copy_(torch.tensor([[100.0], [-100.0]]))
+        model.bias.zero_()
+    estimator = (
+        make_ella(model, subsample_size=2, n_eigenvalues=1)
+        if method == "nystrom"
+        else make_valla(model, inducing_locations=inputs[:2].clone())
+    )
+    if method == "nystrom":
+        estimator.fit(train, val_loader=validation)
+    else:
+        estimator.fit(train, iterations=1, val_loader=validation)
+    assert torch.all(estimator(inputs)[:, 1] == 0)
+    mean, covariance = estimator.predictive_moments(inputs)
+    scaled = mean / torch.sqrt(1 + torch.pi / 8 * covariance.diagonal(dim1=-2, dim2=-1))
+    expected = torch.nn.functional.cross_entropy(scaled, validation_targets)
+    observed = estimator._validation_nll(validation)
+    assert torch.isfinite(observed)
+    torch.testing.assert_close(observed, expected)
+    assert torch.isfinite(torch.tensor(estimator.fit_history_["val_nll"])).all()
+    if method == "nystrom":
+        estimator.optimize_hyperparameters(validation, [1.0, 2.0])
+        assert len(estimator.fit_history_["tuning"]) == 2
+        assert all(
+            torch.isfinite(torch.tensor(item["val_nll"]))
+            for item in estimator.fit_history_["tuning"]
+        )
+
+
+def test_ella_prior_grid_distinguishes_empty_and_nonfinite_scores(data, monkeypatch):
+    _, loader, model = data
+    estimator = make_ella(model)
+    estimator.fit(loader)
+    initial_prior = estimator.prior_precision.clone()
+    initial_noise = estimator.sigma_noise.clone()
+    with pytest.raises(ValueError, match="grid is empty"):
+        estimator.optimize_hyperparameters(loader, [])
+    monkeypatch.setattr(
+        estimator, "_validation_nll", lambda _: torch.tensor(float("inf"))
+    )
+    with pytest.raises(ValueError, match="No finite validation NLL"):
+        estimator.optimize_hyperparameters(loader, [2.0, 3.0])
+    torch.testing.assert_close(estimator.prior_precision, initial_prior)
+    torch.testing.assert_close(estimator.sigma_noise, initial_noise)
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_periodic_validation_across_training_batches(data, method):
+    inputs, loader, model = data
+    estimator = (
+        make_ella(model)
+        if method == "nystrom"
+        else make_valla(model, inducing_locations=inputs[:2].clone())
+    )
+    if method == "nystrom":
+        estimator.fit(loader, val_loader=loader, val_steps=1)
+        assert len(estimator.fit_history_["val_nll"]) == len(loader)
+    else:
+        estimator.fit(loader, iterations=3, val_loader=loader, val_steps=2)
+        assert len(estimator.fit_history_["objective"]) == 3
+        assert len(estimator.fit_history_["val_nll"]) == 2
+    assert torch.isfinite(torch.tensor(estimator.fit_history_["val_nll"])).all()
+
+
+def test_ella_joint_prior_noise_grid_selects_best_candidate(data):
+    inputs, _, _ = data
+    loader = DataLoader(
+        TensorDataset(inputs, inputs.sum(-1, keepdim=True)), batch_size=2
+    )
+    estimator = make_ella(torch.nn.Linear(2, 1), "regression")
+    estimator.fit(loader)
+    estimator.optimize_hyperparameters(loader, [(0.1, 0.5), (10.0, 2.0)])
+    scores = estimator.fit_history_["tuning"]
+    assert len(scores) == 2
+    selected = min(scores, key=lambda item: item["val_nll"])
+    assert float(estimator.prior_precision) == pytest.approx(
+        selected["prior_precision"]
+    )
+    assert float(estimator.sigma_noise) == pytest.approx(selected["sigma_noise"])
+
+
+def test_ella_rejects_rank_deficient_nystrom_subset():
+    inputs = torch.ones(4, 1)
+    loader = DataLoader(TensorDataset(inputs, torch.zeros_like(inputs)), batch_size=2)
+    estimator = make_ella(
+        torch.nn.Linear(1, 1, bias=False),
+        "regression",
+        subsample_size=2,
+        n_eigenvalues=2,
+    )
+    with pytest.raises(ValueError, match="insufficient positive rank"):
+        estimator.fit(loader)
+
+
 @pytest.mark.parametrize("backend", [CurvlinopsGGN, AsdlGGN, BackPackGGN])
 def test_ella_accepts_small_full_rank_subset_kernel(backend):
     class ScaledLinear(torch.nn.Module):
@@ -754,6 +857,45 @@ class RewardModel(torch.nn.Module):
         return output.squeeze(-1) if x.ndim == 3 else output
 
 
+def test_valla_kmeans_initializes_from_floating_training_inputs(data):
+    inputs, loader, model = data
+    estimator = make_valla(model, inducing_locations="kmeans", num_inducing=2, seed=7)
+    estimator.fit(loader, iterations=1, lr=1e-10)
+    assert estimator.inducing_locations.shape == (2, 2)
+    for location in estimator.inducing_locations:
+        assert torch.any(torch.all(torch.isclose(inputs, location, atol=1e-6), dim=-1))
+
+
+def test_valla_kmeans_rejects_mapping_inputs():
+    pairs = torch.randn(4, 2, 2)
+    labels = torch.zeros(4, dtype=torch.long)
+    loader = DataLoader(
+        [{"input_ids": pair, "labels": label} for pair, label in zip(pairs, labels)],
+        batch_size=2,
+    )
+    estimator = make_valla(
+        RewardModel(), "reward_modeling", inducing_locations="kmeans", num_inducing=2
+    )
+    with pytest.raises(ValueError, match="kmeans requires floating-point tensor"):
+        estimator.fit(loader, iterations=1)
+
+
+def test_valla_kmeans_rejects_integer_inputs():
+    class CastLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(2, 2)
+
+        def forward(self, inputs):
+            return self.linear(inputs.float())
+
+    inputs = torch.tensor([[0, 0], [1, 0], [0, 1], [1, 1]])
+    loader = DataLoader(TensorDataset(inputs, torch.tensor([0, 1, 1, 0])), batch_size=2)
+    estimator = make_valla(CastLinear(), inducing_locations="kmeans", num_inducing=2)
+    with pytest.raises(ValueError, match="kmeans requires floating-point tensor"):
+        estimator.fit(loader, iterations=1)
+
+
 @pytest.mark.parametrize("method", ["nystrom", "variational"])
 @pytest.mark.parametrize("mapping", [False, True])
 def test_reward_modeling_pair_fit_single_prediction(method, mapping):
@@ -800,6 +942,30 @@ def test_valla_selected_output_backends(data, backend):
     estimator = make_valla(model, inducing_locations=x[:2].clone(), backend=backend)
     estimator.fit(loader, iterations=1, lr=1e-3)
     assert torch.isfinite(estimator.predictive_moments(x[:2])[1]).all()
+
+
+@pytest.mark.parametrize("backend", [CurvlinopsGGN, AsdlGGN, BackPackGGN])
+def test_selected_output_jacobians_match_autograd(backend):
+    torch.manual_seed(31)
+    model = torch.nn.Sequential(
+        torch.nn.Linear(2, 4), torch.nn.Tanh(), torch.nn.Linear(4, 3)
+    )
+    model.output_size = 3
+    inputs = torch.randn(3, 2)
+    selectors = torch.tensor([2, 0, 1])
+    interface = backend(model, "classification")
+    observed, outputs = interface.selected_output_jacobians(inputs, selectors)
+    expected_outputs = model(inputs)
+    rows = []
+    for index, selected in enumerate(selectors):
+        gradients = torch.autograd.grad(
+            expected_outputs[index, selected],
+            tuple(model.parameters()),
+            retain_graph=True,
+        )
+        rows.append(torch.cat([gradient.reshape(-1) for gradient in gradients]))
+    torch.testing.assert_close(outputs, expected_outputs)
+    torch.testing.assert_close(observed[:, 0, :], torch.stack(rows))
 
 
 @pytest.mark.parametrize("backend", [CurvlinopsGGN, AsdlGGN, BackPackGGN])
@@ -1083,6 +1249,20 @@ def test_valla_fixed_integer_inducing_is_a_snapshot():
     assert selected.data_ptr() != inputs.data_ptr()
     inputs.add_(10)
     torch.testing.assert_close(selected, torch.tensor([[1, 2], [3, 4]]))
+
+
+def test_ella_balanced_subset_includes_rare_class():
+    torch.manual_seed(32)
+    inputs = torch.randn(10, 2)
+    labels = torch.tensor([0] * 9 + [1])
+    loader = DataLoader(TensorDataset(inputs, labels), batch_size=2)
+    estimator = make_ella(
+        torch.nn.Linear(2, 2), subsample_size=4, n_eigenvalues=2, seed=32
+    )
+    selected = estimator._indices(loader, balanced=True)
+    assert torch.bincount(labels[selected], minlength=2).tolist() == [3, 1]
+    estimator.fit(loader, balanced=True)
+    assert estimator.fit_history_["processed_examples"][-1] == 10
 
 
 @pytest.mark.parametrize("method", ["nystrom", "variational"])
