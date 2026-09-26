@@ -208,6 +208,21 @@ def test_classification_noise_remains_one(method, data):
     )
 
 
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+@pytest.mark.parametrize("option", ["prior_precision", "sigma_noise", "temperature"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_functional_hyperparameters_must_be_finite(method, option, value, data):
+    x, _, _ = data
+    model = torch.nn.Linear(2, 1)
+    constructor = make_ella if method == "nystrom" else make_valla
+    options = {} if method == "nystrom" else {"inducing_locations": x[:2].clone()}
+    with pytest.raises(ValueError, match=option):
+        constructor(model, "regression", **options, **{option: value})
+    estimator = constructor(model, "regression", **options)
+    with pytest.raises(ValueError, match=option):
+        setattr(estimator, option, value)
+
+
 def test_ella_temperature_update_refreshes_posterior(data):
     x, _, _ = data
     targets = x.sum(dim=-1, keepdim=True)
@@ -239,14 +254,25 @@ def test_valla_fit_validates_mutated_options(data):
     with pytest.raises(ValueError, match="mc_softmax_samples"):
         estimator.fit(loader, iterations=1)
     estimator.mc_softmax_samples = 0
-    estimator.temperature = -1.0
     with pytest.raises(ValueError, match="temperature must be positive"):
-        estimator.fit(loader, iterations=1)
-    estimator.temperature = 1.0
+        estimator.temperature = -1.0
     estimator.fit(loader, iterations=1)
     estimator.inducing_classes = torch.tensor([0])
     with pytest.raises(ValueError, match="inducing_classes"):
         estimator.fit(loader, iterations=1, override=False)
+
+
+def test_functional_integer_options_and_learning_rate_validate_early(data):
+    x, loader, model = data
+    with pytest.raises(ValueError, match="n_eigenvalues"):
+        make_ella(model, subsample_size=1.5)
+    with pytest.raises(ValueError, match="num_inducing"):
+        make_valla(model, inducing_locations="random", num_inducing=1.5)
+    estimator = make_valla(model, inducing_locations=x[:2].clone())
+    with pytest.raises(ValueError, match="iterations"):
+        estimator.fit(loader, iterations=1.5)
+    with pytest.raises(ValueError, match="lr"):
+        estimator.fit(loader, iterations=1, lr=float("inf"))
 
 
 @pytest.mark.parametrize("strategy", ["fixed", "random"])
@@ -480,6 +506,78 @@ def test_fit_preserves_pretrained_gradient_buffers(data, method, backend):
             assert parameter.grad is None
         else:
             torch.testing.assert_close(parameter.grad, old_gradient)
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_backpack_prediction_preserves_pretrained_gradient_buffers(data, method):
+    x, loader, model = data
+    estimator = (
+        make_ella(model, backend=BackPackGGN)
+        if method == "nystrom"
+        else make_valla(model, inducing_locations=x[:2].clone(), backend=BackPackGGN)
+    )
+    if method == "nystrom":
+        estimator.fit(loader)
+    else:
+        estimator.fit(loader, iterations=1)
+
+    predictions = (
+        lambda: estimator.predictive_moments(x[:1]),
+        lambda: estimator(x[:1]),
+        lambda: estimator.functional_samples(x[:1], n_samples=2),
+        lambda: estimator.predictive_samples(x[:1], n_samples=2),
+    )
+    if method == "variational":
+        jacobians, _ = estimator.backend.jacobians(x[:1])
+        predictions += (
+            lambda: estimator.functional_variance(jacobians),
+            lambda: estimator.functional_covariance(jacobians),
+        )
+    for predict in predictions:
+        for parameter in model.parameters():
+            parameter.grad = torch.full_like(parameter, 7)
+        predict()
+        for parameter in model.parameters():
+            torch.testing.assert_close(parameter.grad, torch.full_like(parameter, 7))
+
+
+def test_ella_asdl_reverse_mode_fallback_retains_input_gradients():
+    class Square(torch.autograd.Function):
+        @staticmethod
+        def forward(value):
+            return value.square()
+
+        @staticmethod
+        def setup_context(ctx, inputs, output):
+            ctx.save_for_backward(inputs[0])
+
+        @staticmethod
+        def backward(ctx, gradient):
+            return 2 * ctx.saved_tensors[0] * gradient
+
+    class SquareModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(1, 2)
+
+        def forward(self, inputs):
+            return Square.apply(self.linear(inputs))
+
+    inputs = torch.tensor([[1.0], [2.0], [3.0], [4.0]])
+    model = SquareModel()
+    targets = model(inputs).detach()
+    estimator = make_ella(model, "regression", backend=AsdlGGN, enable_backprop=True)
+    estimator.fit(DataLoader(TensorDataset(inputs, targets), batch_size=2))
+    for parameter in model.parameters():
+        parameter.grad = torch.full_like(parameter, 7)
+
+    query = inputs[:1].clone().requires_grad_()
+    _, covariance = estimator.predictive_moments(query)
+
+    assert covariance.requires_grad
+    assert torch.isfinite(torch.autograd.grad(covariance.sum(), query)[0]).all()
+    for parameter in model.parameters():
+        torch.testing.assert_close(parameter.grad, torch.full_like(parameter, 7))
 
 
 def test_ella_noise_and_validation_grid(data):
