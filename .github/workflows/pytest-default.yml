@@ -22,10 +22,11 @@ jobs:
         run: |
           source .venv/bin/activate
           python3 -m pytest tests
-      - name: Smoke test function-space example
+      - name: Smoke test ELLA and VaLLA examples
         run: |
           source .venv/bin/activate
-          python examples/functional_approximations.py
+          python examples/ella.py
+          python examples/valla.py
       - name: Build documentation with strict checks
         run: |
           source .venv/bin/activate
