@@ -701,16 +701,15 @@ class BaseLaplace:
                 torch.finfo(f_var.dtype).eps * f_var.abs().sum(dim=(1, 2), keepdim=True)
             )
             safe_variance = torch.where(centered, 1, sum_variance)
+            ratio = torch.where(
+                centered.squeeze(-1), 0, row_sums / safe_variance.squeeze(-1)
+            )
             f_mu = f_mu - torch.where(
                 centered.squeeze(-1),
                 f_mu.mean(dim=-1, keepdim=True),
-                row_sums * f_mu.sum(dim=-1, keepdim=True) / safe_variance.squeeze(-1),
+                ratio * f_mu.sum(dim=-1, keepdim=True),
             )
-            f_var = f_var - torch.where(
-                centered,
-                0,
-                row_sums.unsqueeze(-1) * row_sums.unsqueeze(-2) / safe_variance,
-            )
+            f_var = f_var - ratio.unsqueeze(-1) * row_sums.unsqueeze(-2)
             f_var_diag = f_var.diagonal(dim1=-2, dim2=-1)
             valid_variance = (f_var_diag > 0).all(dim=-1, keepdim=True)
 

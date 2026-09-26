@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from torchvision.models import wide_resnet50_2
 
 from laplace import DiagLaplace, FullLaplace, KronLaplace, LowRankLaplace
+from laplace.baselaplace import BaseLaplace
 from laplace.curvature import AsdlEF, AsdlGGN, BackPackGGN
 from laplace.curvature.backpack import BackPackEF
 from laplace.curvature.curvlinops import CurvlinopsEF, CurvlinopsGGN
@@ -31,6 +32,29 @@ if find_spec("asdfghjkl") is not None:
     flavors.append(LowRankLaplace)
 
 online_flavors = [FullLaplace, KronLaplace, DiagLaplace]
+
+
+@pytest.mark.parametrize("n_classes", [2, 5])
+@pytest.mark.parametrize("scale", [1e20, 1e38])
+@pytest.mark.parametrize("link", ["bridge", "bridge_norm"])
+def test_bridge_large_float32_covariance_has_finite_gradients(n_classes, scale, link):
+    class FixedMoments:
+        def _glm_predictive_distribution(self, x, joint=False):
+            return mean, covariance
+
+    mean = torch.linspace(0.2, 0.3, n_classes, dtype=torch.float32).reshape(1, -1)
+    mean.requires_grad_()
+    covariance = (scale * torch.eye(n_classes, dtype=torch.float32)).unsqueeze(0)
+    covariance.requires_grad_()
+    probability = BaseLaplace._glm_forward_call(
+        FixedMoments(), mean, "classification", link_approx=link
+    )
+    assert torch.isfinite(probability).all()
+    torch.testing.assert_close(
+        probability.sum(dim=-1), torch.ones(1, dtype=probability.dtype)
+    )
+    gradients = torch.autograd.grad(probability[0, 0], (mean, covariance))
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
 @pytest.fixture
