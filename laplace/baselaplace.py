@@ -675,41 +675,60 @@ class BaseLaplace:
                 work_dtype = torch.float64
             f_mu, f_var = f_mu.to(work_dtype), f_var.to(work_dtype)
 
-            # A zero-sum covariance is already centered and needs no correction.
-            row_sums = f_var.sum(dim=-1)
-            sum_variance = f_var.sum(dim=(1, 2), keepdim=True)
+            # Normalize covariance before reductions: even float64 sums can
+            # overflow when each covariance entry is finite. The scale
+            # cancels in the ratio, so detach it to avoid unstable gradients
+            # through the normalization itself.
+            covariance_scale = f_var.detach().abs().amax(dim=(1, 2), keepdim=True)
+            safe_covariance_scale = torch.where(
+                covariance_scale > 0, covariance_scale, 1
+            )
+            scaled_covariance = f_var / safe_covariance_scale
+            row_sums = scaled_covariance.sum(dim=-1)
+            sum_variance = row_sums.sum(dim=-1, keepdim=True).unsqueeze(-1)
             centered = sum_variance.abs() <= (
                 torch.finfo(covariance_dtype).eps
-                * f_var.abs().sum(dim=(1, 2), keepdim=True)
+                * scaled_covariance.abs().sum(dim=(1, 2), keepdim=True)
             )
             safe_variance = torch.where(centered, 1, sum_variance)
             ratio = torch.where(
                 centered.squeeze(-1), 0, row_sums / safe_variance.squeeze(-1)
             )
+            # Divide before summing so a finite common logit offset cannot
+            # overflow the reduction in float64.
+            mean_logit = (f_mu / K).sum(dim=-1, keepdim=True)
             f_mu = f_mu - torch.where(
                 centered.squeeze(-1),
-                f_mu.mean(dim=-1, keepdim=True),
-                ratio * f_mu.sum(dim=-1, keepdim=True),
+                mean_logit,
+                (K * ratio) * mean_logit,
             )
-            f_var = f_var - ratio.unsqueeze(-1) * row_sums.unsqueeze(-2)
-            f_var_diag = f_var.diagonal(dim1=-2, dim2=-1)
+            centered_covariance = scaled_covariance - ratio.unsqueeze(
+                -1
+            ) * row_sums.unsqueeze(-2)
+            f_var_diag = centered_covariance.diagonal(
+                dim1=-2, dim2=-1
+            ) * safe_covariance_scale.squeeze(-1)
             centered_mu, centered_var_diag = f_mu, f_var_diag
             valid_variance = (f_var_diag > 0).all(dim=-1, keepdim=True)
 
             if link_approx == LinkApprox.BRIDGE_NORM:
-                variance_scale = f_var_diag.mean(dim=-1, keepdim=True) / sqrt(K / 2)
+                variance_scale = (f_var_diag / K).sum(dim=-1, keepdim=True) / sqrt(
+                    K / 2
+                )
                 valid_variance &= variance_scale > 0
                 safe_scale = torch.where(variance_scale > 0, variance_scale, 1)
-                f_mu = f_mu / safe_scale.sqrt()
+                f_mu = f_mu * safe_scale.rsqrt()
                 f_var_diag = f_var_diag / safe_scale
 
             # Normalize the Bridge's Dirichlet parameters in log space.
-            log_component = (
-                f_mu + torch.logsumexp(-f_mu, dim=-1, keepdim=True) - 2 * log(K)
-            )
+            # The log-sum-exp term is common to every class and cancels in
+            # the final softmax. Remove it before combining the numerator
+            # terms, avoiding overflow when finite logit gaps are enormous.
+            log_sum_negative = torch.logsumexp(-f_mu, dim=-1, keepdim=True)
             log_base = log(1 - 2 / K) if K > 2 else -float("inf")
             log_numerator = torch.logaddexp(
-                torch.full_like(log_component, log_base), log_component
+                torch.full_like(f_mu, log_base) - log_sum_negative,
+                f_mu - 2 * log(K),
             )
             log_alpha = (
                 log_numerator

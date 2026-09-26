@@ -107,6 +107,72 @@ def test_bridge_finite_float32_inputs_have_finite_gradients(link, case):
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
+@pytest.mark.parametrize("link", ["bridge", "bridge_norm"])
+@pytest.mark.parametrize(
+    "logits",
+    [
+        [1e308, -1e308],
+        [1e308, 1e308],
+        [1e308, -1e308, 0.0],
+        [1e308, 1e308, 1e308],
+    ],
+)
+def test_bridge_extreme_finite_float64_logits_have_finite_gradients(logits, link):
+    mean = torch.tensor([logits], dtype=torch.float64, requires_grad=True)
+    covariance = torch.eye(len(logits), dtype=torch.float64).unsqueeze(0)
+    covariance.requires_grad_()
+    probability = _bridge_from_moments(mean, covariance, link)
+    assert torch.isfinite(probability).all()
+    torch.testing.assert_close(
+        probability.sum(dim=-1), torch.ones(1, dtype=probability.dtype)
+    )
+    gradients = torch.autograd.grad(probability[0, 0], (mean, covariance))
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+
+
+@pytest.mark.parametrize("link", ["bridge", "bridge_norm"])
+def test_bridge_finite_float64_covariance_scale_invariance(link):
+    mean = torch.tensor([[3.0, 0.0, -1.0]], dtype=torch.float64, requires_grad=True)
+    diagonal = torch.tensor([1.0, 1.0, 0.5], dtype=torch.float64)
+    moderate = torch.diag(diagonal * 1e100).unsqueeze(0)
+    huge = torch.diag(diagonal * 1e308).unsqueeze(0).requires_grad_()
+    expected = _bridge_from_moments(mean, moderate, link)
+    actual = _bridge_from_moments(mean, huge, link)
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+    gradients = torch.autograd.grad(actual[0, 0], (mean, huge))
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+@pytest.mark.parametrize("device_index", range(max(torch.cuda.device_count(), 1)))
+@pytest.mark.parametrize("link", ["bridge", "bridge_norm"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("case", ["extreme_logits", "large_covariance"])
+def test_bridge_gpu_extreme_finite_inputs(device_index, link, dtype, case):
+    device = torch.device(f"cuda:{device_index}")
+    if case == "extreme_logits":
+        magnitude = 3e38 if dtype == torch.float32 else 1e308
+        mean = torch.tensor([[magnitude, -magnitude, 0.0]], dtype=dtype, device=device)
+        covariance = torch.eye(3, dtype=dtype, device=device).unsqueeze(0)
+    else:
+        magnitude = 1e38 if dtype == torch.float32 else 1e308
+        mean = torch.tensor([[3.0, 0.0, -1.0]], dtype=dtype, device=device)
+        covariance = torch.diag(
+            torch.tensor(
+                [magnitude, magnitude, magnitude / 2], dtype=dtype, device=device
+            )
+        ).unsqueeze(0)
+    mean.requires_grad_()
+    covariance.requires_grad_()
+    probability = _bridge_from_moments(mean, covariance, link)
+    assert torch.isfinite(probability).all()
+    torch.testing.assert_close(
+        probability.sum(dim=-1), torch.ones_like(probability.sum(dim=-1))
+    )
+    gradients = torch.autograd.grad(probability[0, 0], (mean, covariance))
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+
+
 @pytest.mark.parametrize("method", ["sod", "diag"])
 @pytest.mark.parametrize("link", ["bridge", "bridge_norm"])
 def test_bridge_probabilities_with_zero_sum_logit_covariance(method, link):
