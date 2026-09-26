@@ -2275,8 +2275,9 @@ class BaseFunctionalLaplace(BaseLaplace):
 
         Classification returns probabilities `[B, C]`; regression and scalar
         reward prediction return a latent mean `[B, O]` and covariance
-        `[B, O, O]`. With `joint=True`, the mean is flattened and covariance
-        has shape `[B*O, B*O]`. `fitting=True` evaluates pairwise reward inputs
+        `[B, O, O]` (or variance `[B, O]` with `diagonal_output=True`). With
+        `joint=True`, the mean is flattened and covariance has shape
+        `[B*O, B*O]`. `fitting=True` evaluates pairwise reward inputs
         as classification. `link_approx` selects the classification link, and
         `n_samples` controls Monte Carlo links. Only `pred_type='gp'` is
         supported; use `functional_samples` for latent draws.
@@ -2319,10 +2320,50 @@ class BaseFunctionalLaplace(BaseLaplace):
             root = torch.linalg.cholesky(covariance)
         except LinAlgError:
             # A rank-limited function-space posterior can be singular.
-            values, vectors = torch.linalg.eigh(covariance)
-            if torch.any(values < -1e-5):
+            values, vectors = torch.linalg.eigh(
+                covariance.detach() if covariance.requires_grad else covariance
+            )
+            # Low-rank PSD matrices can acquire negative eigenvalues from
+            # float32 rounding; judge them relative to the covariance scale.
+            tolerance = (
+                10
+                * torch.finfo(covariance.dtype).eps
+                * covariance.shape[-1]
+                * values.abs().amax(dim=-1, keepdim=True)
+            )
+            if torch.any(values < -tolerance):
                 raise
-            root = vectors @ torch.diag_embed(values.clamp_min(0).sqrt())
+            if covariance.requires_grad:
+                # Eigenvectors and sqrt have undefined derivatives at repeated
+                # zero eigenvalues. Keep MC objectives differentiable there.
+                scale = (
+                    covariance.diagonal(dim1=-2, dim2=-1).detach().abs().amax(dim=-1)
+                )
+                scale = torch.where(scale > 0, scale, 1)
+                identity = torch.eye(
+                    covariance.shape[-1],
+                    device=covariance.device,
+                    dtype=covariance.dtype,
+                )
+                negative_shift = -values.amin(dim=-1).clamp_max(0)
+                for multiplier in (1, 10, 100):
+                    jitter = (
+                        negative_shift
+                        + multiplier * torch.finfo(covariance.dtype).eps * scale
+                    )
+                    try:
+                        root = torch.linalg.cholesky(
+                            covariance + jitter[..., None, None] * identity
+                        )
+                        break
+                    except LinAlgError:
+                        continue
+                else:
+                    raise RuntimeError(
+                        "Could not factor a differentiable functional covariance."
+                    )
+            else:
+                root = vectors @ torch.diag_embed(values.clamp_min(0).sqrt())
         noise = torch.randn(
             (n_samples, *mean.shape),
             device=mean.device,
