@@ -537,6 +537,50 @@ def test_valla_classification_mc_energy(data, alpha):
     assert estimator.state_dict()["mc_softmax_samples"] == 4
 
 
+def test_valla_mc_fit_keeps_finite_parameters_with_zero_covariance():
+    inputs = torch.zeros(2, 1)
+    targets = torch.tensor([0, 1])
+    model = torch.nn.Linear(1, 2, bias=False)
+    estimator = make_valla(
+        model,
+        inducing_locations=inputs[:1].clone(),
+        mc_softmax_samples=2,
+        backend=CurvlinopsGGN,
+    )
+
+    estimator.fit(
+        DataLoader(TensorDataset(inputs, targets), batch_size=2), iterations=1
+    )
+
+    assert torch.isfinite(estimator.L).all()
+    assert torch.isfinite(estimator.prior_precision).all()
+    assert torch.isfinite(estimator(inputs[:1], link_approx="mc", n_samples=4)).all()
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+def test_rank_limited_joint_sampling_tolerates_float32_roundoff(method):
+    train = torch.ones(2, 1)
+    loader = DataLoader(TensorDataset(train, train), batch_size=2)
+    model = torch.nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(1)
+    estimator = (
+        make_ella(model, "regression", subsample_size=2, n_eigenvalues=1)
+        if method == "nystrom"
+        else make_valla(model, "regression", inducing_locations=train[:1].clone())
+    )
+    if method == "nystrom":
+        estimator.fit(loader)
+    else:
+        estimator.fit(loader, iterations=1)
+
+    query = torch.tensor([[15409.96], [-2934.29], [-21787.89], [5684.31], [-10845.22]])
+    samples = estimator.functional_samples(query, joint=True, n_samples=3)
+
+    assert samples.shape == (3, 5, 1)
+    assert torch.isfinite(samples).all()
+
+
 def test_valla_random_inducing_and_prior_fit(data):
     x, _, _ = data
     loader = DataLoader(TensorDataset(x, x.sum(-1, keepdim=True)), batch_size=2)
