@@ -1,4 +1,4 @@
-"""Small CPU example of the function-space Laplace factory methods."""
+"""Fit and query VaLLA through the Laplace factory on a small CPU dataset."""
 
 import torch
 from torch.utils.data import DataLoader, TensorDataset
@@ -12,22 +12,8 @@ def main() -> None:
     targets = inputs.sum(dim=-1, keepdim=True)
     loader = DataLoader(TensorDataset(inputs, targets), batch_size=2)
 
-    ella_model = torch.nn.Linear(2, 1)
-    ella = Laplace(
-        ella_model,
-        "regression",
-        subset_of_weights="all",
-        hessian_structure="gp",
-        functional_approximation="nystrom",
-        subsample_size=2,
-        n_eigenvalues=1,
-        sigma_noise=0.2,
-    )
-    ella.fit(loader)
-
-    valla_model = torch.nn.Linear(2, 1)
     valla = Laplace(
-        valla_model,
+        torch.nn.Linear(2, 1),
         "regression",
         subset_of_weights="all",
         hessian_structure="gp",
@@ -37,10 +23,8 @@ def main() -> None:
         sigma_noise=0.2,
     )
     valla.fit(loader, iterations=2, lr=1e-3)
-
-    for estimator in (ella, valla):
-        mean, latent_covariance = estimator(inputs[:2], joint=True)
-        print(type(estimator).__name__, mean.shape, latent_covariance.shape)
+    mean, latent_covariance = valla(inputs[:2], joint=True)
+    print("VaLLA", mean.shape, latent_covariance.shape)
 
 
 if __name__ == "__main__":

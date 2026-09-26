@@ -96,7 +96,8 @@ The laplace package consists of two main components:
 
 For `hessian_structure="gp"`, the factory also accepts
 `functional_approximation="sod" | "nystrom" | "variational"`. The latter two
-select `ELLA` and `VaLLA`. These and `FunctionalLaplace` share
+select [`ELLA`](ella.md) and [`VaLLA`](valla.md), respectively. These and
+`FunctionalLaplace` share
 `BaseFunctionalLaplace` prediction and sampling methods, while each estimator
 implements its own fitting and posterior covariance. New function-space methods
 should implement `_glm_predictive_distribution`, `fit`, and method-specific
