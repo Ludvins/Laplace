@@ -52,6 +52,13 @@ To install laplace with `pip`, run the following:
 pip install laplace-torch
 ```
 
+To use changes in this repository before they appear in a published release,
+clone the repository and install it from the checkout:
+
+```bash
+pip install -e .
+```
+
 Additionally, if you want to use the `asdfghjkl` backend, please install it via:
 
 ```bash
