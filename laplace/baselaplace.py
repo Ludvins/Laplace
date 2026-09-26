@@ -2238,6 +2238,16 @@ class BaseFunctionalLaplace(BaseLaplace):
         self._check_nonempty_inputs(x)
         return self._glm_predictive_distribution(x, joint=joint)
 
+    def _classification_validation_nll(
+        self, x: torch.Tensor | MutableMapping, targets: torch.Tensor
+    ) -> torch.Tensor:
+        """Evaluate the probit link without taking log of rounded probabilities."""
+        mean, covariance = self.predictive_moments(x)
+        scale = torch.sqrt(1 + torch.pi / 8 * covariance.diagonal(dim1=-2, dim2=-1))
+        return torch.nn.functional.cross_entropy(
+            mean / scale, classification_targets(targets), reduction="sum"
+        )
+
     def __call__(
         self,
         x: torch.Tensor | MutableMapping,
@@ -3861,14 +3871,7 @@ class ELLA(BaseFunctionalLaplace):
                     )
                 ).sum()
             else:
-                probability = self(
-                    x, fitting=self.likelihood == Likelihood.REWARD_MODELING
-                )
-                assert isinstance(probability, torch.Tensor)
-                y = classification_targets(y)
-                total += torch.nn.functional.nll_loss(
-                    probability.log(), y, reduction="sum"
-                )
+                total += self._classification_validation_nll(x, y)
             count += y.shape[0]
         return total / count
 
@@ -3925,9 +3928,13 @@ class ELLA(BaseFunctionalLaplace):
 
     def optimize_hyperparameters(self, val_loader: DataLoader, grid) -> None:
         self._check_fitted()
+        initial_prior = self.prior_precision.detach().clone()
+        initial_noise = self.sigma_noise.detach().clone()
         best_score = float("inf")
         best = None
+        has_candidates = False
         for candidate in grid:
+            has_candidates = True
             if isinstance(candidate, (tuple, list)):
                 self.prior_precision, self.sigma_noise = candidate
             else:
@@ -3940,10 +3947,14 @@ class ELLA(BaseFunctionalLaplace):
                     "val_nll": score,
                 }
             )
-            if score < best_score:
+            if isfinite(score) and score < best_score:
                 best_score, best = score, candidate
         if best is None:
-            raise ValueError("Hyperparameter grid is empty.")
+            self.prior_precision, self.sigma_noise = initial_prior, initial_noise
+            self._refresh_posterior()
+            if not has_candidates:
+                raise ValueError("Hyperparameter grid is empty.")
+            raise ValueError("No finite validation NLL was found in the grid.")
         if isinstance(best, (tuple, list)):
             self.prior_precision, self.sigma_noise = best
         else:
@@ -4493,14 +4504,7 @@ class VaLLA(BaseFunctionalLaplace):
                     )
                 ).sum()
             else:
-                probability = self(
-                    x, fitting=self.likelihood == Likelihood.REWARD_MODELING
-                )
-                assert isinstance(probability, torch.Tensor)
-                y = classification_targets(y)
-                total += torch.nn.functional.nll_loss(
-                    probability.log(), y, reduction="sum"
-                )
+                total += self._classification_validation_nll(x, y)
             count += y.shape[0]
         return total / count
 
