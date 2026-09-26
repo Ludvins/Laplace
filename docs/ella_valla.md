@@ -84,6 +84,14 @@ checkpoint restores the sampling seed (and VaLLA's random-generator state).
 See the [ELLA](api_reference/ella.md) and
 [VaLLA](api_reference/valla.md) API references.
 
+## CUDA tests
+
+With a CUDA-enabled PyTorch installation, run
+`pytest -m cuda tests/test_ella_valla_cuda.py` from the Laplace checkout.
+The tests exercise every visible CUDA device across ELLA and VaLLA fitting,
+latent and joint moments, input gradients, sampling, reward mapping inputs,
+and checkpoints. CPU-only installations skip them explicitly.
+
 ## Reference behavior from the earlier ports
 
 `tests/test_ella_valla.py` retains seeded values from BayesiPy commit `5ee24ed`.
