@@ -601,7 +601,7 @@ wheels = [
 
 [[package]]
 name = "laplace-torch"
-version = "0.2.2.2"
+version = "0.2.3"
 source = { editable = "." }
 dependencies = [
     { name = "asdfghjkl" },
@@ -639,7 +639,7 @@ requires-dist = [
     { name = "asdfghjkl", specifier = "==0.1a4" },
     { name = "backpack-for-pytorch" },
     { name = "coveralls", marker = "extra == 'dev'" },
-    { name = "curvlinops-for-pytorch", specifier = ">=2.0" },
+    { name = "curvlinops-for-pytorch", specifier = ">=2.0,<3.0" },
     { name = "numpy" },
     { name = "opt-einsum" },
     { name = "pytest", marker = "extra == 'dev'" },

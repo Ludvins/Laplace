@@ -23,7 +23,7 @@ requires-python = ">=3.9"
 dependencies = [
   "asdfghjkl == 0.1a4",
   "backpack-for-pytorch",
-  "curvlinops-for-pytorch >= 2.0",
+  "curvlinops-for-pytorch >= 2.0, < 3.0",
   "numpy",
   "opt_einsum",
   "torch >= 2.0",
