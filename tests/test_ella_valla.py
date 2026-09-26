@@ -7,6 +7,7 @@ import torch
 from torch.utils.data import (
     BatchSampler,
     DataLoader,
+    RandomSampler,
     SequentialSampler,
     SubsetRandomSampler,
     TensorDataset,
@@ -760,7 +761,10 @@ def test_reward_modeling_pair_fit_single_prediction(method, mapping):
     pairs = torch.randn(6, 2, 2)
     labels = torch.randint(0, 2, (6,))
     dataset = (
-        [{"input_ids": pair, "labels": label} for pair, label in zip(pairs, labels)]
+        [
+            {"input_ids": pair, "labels": label, "source": "demo"}
+            for pair, label in zip(pairs, labels)
+        ]
         if mapping
         else TensorDataset(pairs, labels)
     )
@@ -779,6 +783,8 @@ def test_reward_modeling_pair_fit_single_prediction(method, mapping):
         estimator.fit(loader)
     else:
         estimator.fit(loader, iterations=1, lr=1e-3)
+    if method == "variational" and mapping:
+        assert estimator.inducing_locations["source"] == ["demo", "demo"]
     pair_input = {"input_ids": pairs[:2]} if mapping else pairs[:2]
     single_input = {"input_ids": pairs[:2, 0]} if mapping else pairs[:2, 0]
     assert estimator(pair_input, fitting=True).shape == (2, 2)
@@ -1405,3 +1411,102 @@ def test_valla_checkpoint_restores_random_inducing_seed(data):
     torch.testing.assert_close(
         restored.inducing_locations, estimator.inducing_locations
     )
+
+
+@pytest.mark.parametrize("method", ["nystrom", "variational"])
+@pytest.mark.parametrize("option", ["prior_precision", "sigma_noise"])
+def test_functional_hyperparameters_remain_finite_in_model_dtype(method, option):
+    model = torch.nn.Linear(1, 1).float()
+    options = (
+        {"subsample_size": 1, "n_eigenvalues": 1}
+        if method == "nystrom"
+        else {"inducing_locations": torch.ones(1, 1)}
+    )
+    constructor = make_ella if method == "nystrom" else make_valla
+    overflow = torch.tensor(1e50, dtype=torch.float64)
+    with pytest.raises(ValueError, match=option):
+        constructor(model, "regression", **options, **{option: overflow})
+    estimator = constructor(model, "regression", **options)
+    with pytest.raises(ValueError, match=option):
+        setattr(estimator, option, overflow)
+
+
+@pytest.mark.parametrize("drop_last", [False, True])
+def test_ella_replays_partial_random_sampler_epoch(drop_last):
+    class CountingRandomSampler(RandomSampler):
+        def __iter__(self):
+            self.calls += 1
+            yield from super().__iter__()
+
+    row_ids = torch.arange(1, 13, dtype=torch.float32)
+    inputs = torch.stack([row_ids, row_ids.square()], dim=-1)
+    dataset = TensorDataset(inputs, inputs.sum(dim=-1, keepdim=True))
+    sampler = CountingRandomSampler(
+        dataset,
+        replacement=False,
+        num_samples=5 if drop_last else 4,
+        generator=torch.Generator().manual_seed(12),
+    )
+    sampler.calls = 0
+    loader = DataLoader(dataset, batch_size=2, sampler=sampler, drop_last=drop_last)
+    estimator = make_ella(
+        torch.nn.Linear(2, 1),
+        "regression",
+        subsample_size=2,
+        n_eigenvalues=2,
+    )
+    basis_indices = []
+    fitted_indices = []
+    original_build_basis = estimator._build_basis
+    original_features = estimator._features
+
+    def build_basis(source, indices):
+        basis_indices.extend(indices.tolist())
+        return original_build_basis(source, indices)
+
+    def features(x):
+        fitted_indices.extend((x[:, 0] - 1).long().tolist())
+        return original_features(x)
+
+    estimator._build_basis = build_basis
+    estimator._features = features
+    estimator.fit(loader)
+    assert sampler.calls == 1
+    assert estimator.n_data == len(fitted_indices) == 4
+    assert set(basis_indices) <= set(fitted_indices)
+
+
+def test_valla_random_mapping_inducing_accepts_row_metadata():
+    class MappingDataset(torch.utils.data.Dataset):
+        def __len__(self):
+            return 4
+
+        def __getitem__(self, index):
+            return {
+                "input_ids": torch.tensor([float(index), float(index + 1)]),
+                "labels": torch.tensor(index % 2),
+                "source": f"row-{index}",
+            }
+
+    class MappingModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(2, 2)
+
+        def forward(self, batch):
+            return self.linear(batch["input_ids"])
+
+    loader = DataLoader(MappingDataset(), batch_size=2)
+    estimator = make_valla(
+        MappingModel(),
+        inducing_locations="random",
+        num_inducing=2,
+        backend=AsdlGGN,
+    )
+    estimator.fit(loader, iterations=1)
+    assert len(estimator.inducing_locations["source"]) == 2
+    for token, row in zip(
+        estimator.inducing_locations["source"],
+        estimator.inducing_locations["input_ids"],
+    ):
+        assert token == f"row-{int(row[0])}"
