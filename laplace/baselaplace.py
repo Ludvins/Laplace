@@ -666,13 +666,21 @@ class BaseLaplace:
             _, K = f_mu.shape
             if K == 1:
                 return torch.ones_like(f_mu)
-            raw_mu, raw_var = f_mu, f_var
+            # Float32 reductions can overflow even when every input is finite.
+            # Keep the link calculation in double precision, then restore the
+            # predictive dtype at the return boundary.
+            output_dtype, covariance_dtype = f_mu.dtype, f_var.dtype
+            work_dtype = torch.promote_types(output_dtype, covariance_dtype)
+            if work_dtype in (torch.float16, torch.bfloat16, torch.float32):
+                work_dtype = torch.float64
+            f_mu, f_var = f_mu.to(work_dtype), f_var.to(work_dtype)
 
             # A zero-sum covariance is already centered and needs no correction.
             row_sums = f_var.sum(dim=-1)
             sum_variance = f_var.sum(dim=(1, 2), keepdim=True)
             centered = sum_variance.abs() <= (
-                torch.finfo(f_var.dtype).eps * f_var.abs().sum(dim=(1, 2), keepdim=True)
+                torch.finfo(covariance_dtype).eps
+                * f_var.abs().sum(dim=(1, 2), keepdim=True)
             )
             safe_variance = torch.where(centered, 1, sum_variance)
             ratio = torch.where(
@@ -685,6 +693,7 @@ class BaseLaplace:
             )
             f_var = f_var - ratio.unsqueeze(-1) * row_sums.unsqueeze(-2)
             f_var_diag = f_var.diagonal(dim1=-2, dim2=-1)
+            centered_mu, centered_var_diag = f_mu, f_var_diag
             valid_variance = (f_var_diag > 0).all(dim=-1, keepdim=True)
 
             if link_approx == LinkApprox.BRIDGE_NORM:
@@ -707,12 +716,16 @@ class BaseLaplace:
                 - f_var_diag.clamp_min(torch.finfo(f_var_diag.dtype).tiny).log()
             )
             probabilities = torch.softmax(log_alpha, dim=-1)
-            fallback_variance = raw_var.diagonal(dim1=-2, dim2=-1).clamp_min(0)
+            # A common shift of every logit has no effect on softmax. The
+            # fallback therefore uses the centered moments before Bridge's
+            # optional variance normalization.
             fallback = torch.softmax(
-                raw_mu / torch.sqrt(1 + np.pi / 8 * fallback_variance), dim=-1
+                centered_mu
+                / torch.sqrt(1 + np.pi / 8 * centered_var_diag.clamp_min(0)),
+                dim=-1,
             )
             valid_variance &= torch.isfinite(probabilities).all(dim=-1, keepdim=True)
-            return torch.where(valid_variance, probabilities, fallback)
+            return torch.where(valid_variance, probabilities, fallback).to(output_dtype)
         else:
             raise ValueError(
                 "Prediction path invalid. Check the likelihood, pred_type, link_approx combination!"

@@ -34,24 +34,74 @@ if find_spec("asdfghjkl") is not None:
 online_flavors = [FullLaplace, KronLaplace, DiagLaplace]
 
 
-@pytest.mark.parametrize("n_classes", [2, 5])
-@pytest.mark.parametrize("scale", [1e20, 1e38])
-@pytest.mark.parametrize("link", ["bridge", "bridge_norm"])
-def test_bridge_large_float32_covariance_has_finite_gradients(n_classes, scale, link):
+def _bridge_from_moments(mean, covariance, link):
     class FixedMoments:
         def _glm_predictive_distribution(self, x, joint=False):
             return mean, covariance
 
+    return BaseLaplace._glm_forward_call(
+        FixedMoments(), mean, "classification", link_approx=link
+    )
+
+
+@pytest.mark.parametrize("n_classes", [2, 5])
+@pytest.mark.parametrize("scale", [1e20, 1e38])
+@pytest.mark.parametrize("link", ["bridge", "bridge_norm"])
+def test_bridge_large_float32_covariance_has_finite_gradients(n_classes, scale, link):
     mean = torch.linspace(0.2, 0.3, n_classes, dtype=torch.float32).reshape(1, -1)
     mean.requires_grad_()
     covariance = (scale * torch.eye(n_classes, dtype=torch.float32)).unsqueeze(0)
     covariance.requires_grad_()
-    probability = BaseLaplace._glm_forward_call(
-        FixedMoments(), mean, "classification", link_approx=link
-    )
+    probability = _bridge_from_moments(mean, covariance, link)
     assert torch.isfinite(probability).all()
     torch.testing.assert_close(
         probability.sum(dim=-1), torch.ones(1, dtype=probability.dtype)
+    )
+    gradients = torch.autograd.grad(probability[0, 0], (mean, covariance))
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+
+
+@pytest.mark.parametrize("link", ["bridge", "bridge_norm"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_bridge_common_mode_covariance_does_not_change_probabilities(link, dtype):
+    mean = torch.tensor([[3.0, 0.0]], dtype=dtype, requires_grad=True)
+    amplitude = torch.tensor(100.0, dtype=dtype, requires_grad=True)
+    covariance = amplitude * torch.ones(1, 2, 2, dtype=dtype)
+    probability = _bridge_from_moments(mean, covariance, link)
+    torch.testing.assert_close(probability, torch.softmax(mean, dim=-1))
+    gradient = torch.autograd.grad(probability[0, 0], amplitude)[0]
+    torch.testing.assert_close(gradient, torch.zeros_like(gradient), atol=1e-7, rtol=0)
+
+
+@pytest.mark.parametrize("link", ["bridge", "bridge_norm"])
+def test_bridge_large_float32_covariance_matches_float64(link):
+    mean = torch.tensor([[3.0, 0.0, -1.0]], dtype=torch.float32)
+    covariance = torch.diag(
+        torch.tensor([2e38, 1e38, 1e38], dtype=torch.float32)
+    ).unsqueeze(0)
+    actual = _bridge_from_moments(mean, covariance, link)
+    reference = _bridge_from_moments(mean.double(), covariance.double(), link)
+    torch.testing.assert_close(actual.double(), reference, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("link", ["bridge", "bridge_norm"])
+@pytest.mark.parametrize("case", ["dense_covariance", "extreme_logits"])
+def test_bridge_finite_float32_inputs_have_finite_gradients(link, case):
+    if case == "dense_covariance":
+        mean = torch.linspace(0.2, 0.3, 5, dtype=torch.float32).reshape(1, -1)
+        covariance = (
+            9e37 * torch.ones(5, 5, dtype=torch.float32)
+            + 9e36 * torch.eye(5, dtype=torch.float32)
+        ).unsqueeze(0)
+    else:
+        mean = torch.tensor([[3e38, -3e38, 0.0]], dtype=torch.float32)
+        covariance = torch.eye(3, dtype=torch.float32).unsqueeze(0)
+    mean.requires_grad_()
+    covariance.requires_grad_()
+    probability = _bridge_from_moments(mean, covariance, link)
+    assert torch.isfinite(probability).all()
+    torch.testing.assert_close(
+        probability.sum(dim=-1), torch.ones_like(probability.sum(dim=-1))
     )
     gradients = torch.autograd.grad(probability[0, 0], (mean, covariance))
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
